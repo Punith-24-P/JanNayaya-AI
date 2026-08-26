@@ -2,11 +2,8 @@ from pathlib import Path
 from typing import Any
 import json
 
-from paddleocr import PaddleOCR
-
-
 # ============================================================
-# GLOBAL OCR MODEL
+# GLOBAL OCR MODEL (LAZY LOADED)
 # ============================================================
 
 _ocr = None
@@ -16,29 +13,23 @@ _ocr = None
 # GET OCR MODEL
 # ============================================================
 
-def get_ocr() -> PaddleOCR:
+def get_ocr() -> Any:
     """
-    Initialize PaddleOCR only once.
-
-    The OCR model is reused for subsequent requests.
+    Initialize PaddleOCR lazily only when requested.
+    Reuses instance for subsequent requests.
     """
-
     global _ocr
 
     if _ocr is None:
-
-        print("=" * 60)
-        print("Initializing PaddleOCR...")
-
-        _ocr = PaddleOCR(
-            lang="en"
-        )
-
-        print(
-            "PaddleOCR initialized successfully."
-        )
-
-        print("=" * 60)
+        try:
+            print("=" * 60)
+            print("Initializing PaddleOCR...")
+            from paddleocr import PaddleOCR
+            _ocr = PaddleOCR(lang="en")
+            print("PaddleOCR initialized successfully.")
+        except Exception as e:
+            print(f"PaddleOCR fallback notice: {e}")
+            _ocr = None
 
     return _ocr
 
