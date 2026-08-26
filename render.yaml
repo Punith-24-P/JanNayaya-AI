@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: jannyaya-backend
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: PORT
+        value: 10000
+      - key: GROQ_API_KEY
+        sync: false
