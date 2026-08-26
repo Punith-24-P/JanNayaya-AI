@@ -1,58 +1,129 @@
-from backend.pdf_service import extract_text_from_pdf
-from backend.text_cleaner import clean_text
-from backend.chunker import chunk_text
-from backend.embedding_service import create_embeddings
-from backend.vector_store import collection
+"""
+JanNyaya AI - PDF Ingestion
+
+Backward-compatible PDF ingestion used by FastAPI.
+
+For legal documents, processing is handled by:
+    backend.legal_ingest.ingest_legal_document
+"""
+
+import sys
+from pathlib import Path
+
+from backend.legal_ingest import ingest_legal_document
 
 
-def ingest_pdf(file_path: str):
-    print("1. Extracting text...")
+# ============================================================
+# BACKWARD-COMPATIBLE PDF INGESTION
+# ============================================================
 
-    text = extract_text_from_pdf(file_path)
+def ingest_pdf(file_path: str) -> dict:
+    """
+    Ingest a PDF document into the JanNyaya AI knowledge base.
 
-    print(f"Extracted characters: {len(text)}")
+    Generic uploaded PDFs use:
+        document_type = "Other"
+        title = filename
+        authority = "Unknown"
+    """
 
-    print("2. Cleaning text...")
+    if not file_path:
+        raise ValueError(
+            "file_path cannot be empty."
+        )
 
-    cleaned_text = clean_text(text)
+    path = Path(file_path)
 
-    print(f"Cleaned characters: {len(cleaned_text)}")
+    if not path.exists():
+        raise FileNotFoundError(
+            f"PDF file not found: {file_path}"
+        )
 
-    print("3. Creating chunks...")
+    if not path.is_file():
+        raise ValueError(
+            f"Provided path is not a file: {file_path}"
+        )
 
-    chunks = chunk_text(
-        cleaned_text,
-        chunk_size=1000,
-        chunk_overlap=200
+    if path.suffix.lower() != ".pdf":
+        raise ValueError(
+            "Only PDF files are supported."
+        )
+
+    return ingest_legal_document(
+        file_path=str(path),
+        document_type="Other",
+        title=path.name,
+        authority="Unknown",
     )
 
-    print(f"Number of chunks: {len(chunks)}")
 
-    if not chunks:
-        raise ValueError("No chunks were created.")
+# ============================================================
+# COMMAND-LINE TEST
+# ============================================================
 
-    print("4. Creating embeddings...")
+def main() -> None:
+    """
+    Command-line test for PDF ingestion.
 
-    embeddings = create_embeddings(chunks)
+    Usage:
+        python -m backend.ingest path/to/file.pdf
+    """
 
-    print(f"Created embeddings: {len(embeddings)}")
+    if len(sys.argv) < 2:
+        print()
+        print("Usage:")
+        print(
+            "python -m backend.ingest path/to/file.pdf"
+        )
+        print()
+        sys.exit(1)
 
-    print("5. Storing in ChromaDB...")
+    file_path = sys.argv[1]
 
-    ids = [
-        f"chunk_{i}"
-        for i in range(len(chunks))
-    ]
+    print()
+    print("=" * 70)
+    print("JAN NYAYA AI - PDF INGESTION")
+    print("=" * 70)
+    print()
+    print(f"File: {file_path}")
+    print()
 
-    collection.add(
-        ids=ids,
-        documents=chunks,
-        embeddings=embeddings
-    )
+    try:
+        result = ingest_pdf(
+            file_path
+        )
 
-    print("6. Ingestion completed successfully!")
+        print()
+        print("=" * 70)
+        print("INGESTION RESULT")
+        print("=" * 70)
+        print()
 
-    return {
-        "chunks": len(chunks),
-        "characters": len(cleaned_text)
-    }
+        for key, value in result.items():
+            print(
+                f"{key}: {value}"
+            )
+
+        print()
+        print("=" * 70)
+
+    except Exception as error:
+        print()
+        print("=" * 70)
+        print("INGESTION FAILED")
+        print("=" * 70)
+        print()
+        print(
+            str(error)
+        )
+        print()
+
+        raise
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()

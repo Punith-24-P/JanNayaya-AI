@@ -1,328 +1,437 @@
+"""
+JanNyaya AI - Legal-Aware Chunker
+
+This chunker is designed for Indian legal documents.
+
+Goals:
+1. Preserve legal section boundaries.
+2. Preserve the section heading in every chunk.
+3. Keep overlapping chunks for semantic retrieval.
+4. Prevent section metadata from disappearing when a
+   legal section is split across multiple chunks.
+"""
+
 import re
+from typing import List, Tuple
 
 
-# ---------------------------------------------------------
-# LEGAL SECTION DETECTION
-# ---------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-SECTION_PATTERN = re.compile(
-    r"(?m)^(?:\s*)(\d{1,4})\.\s+([^\n]+)"
-)
+DEFAULT_CHUNK_SIZE = 1000
+DEFAULT_CHUNK_OVERLAP = 200
 
 
-def _split_large_section(
-    section_text: str,
-    chunk_size: int,
-    chunk_overlap: int
-) -> list[str]:
+# ============================================================
+# NORMALIZE TEXT
+# ============================================================
+
+def _normalize_text(text: str) -> str:
     """
-    Split a legal section that is larger than chunk_size.
-
-    Tries to split at paragraphs, sub-sections and sentences
-    while preserving the beginning of the legal provision.
-    """
-
-    if len(section_text) <= chunk_size:
-        return [section_text.strip()]
-
-    parts = re.split(
-        r"\n\s*\n|(?<=\.)\s+(?=\(\d+\))|(?<=\.)\s+(?=\([a-z]\))",
-        section_text
-    )
-
-    chunks = []
-    current = ""
-
-    for part in parts:
-        part = part.strip()
-
-        if not part:
-            continue
-
-        if len(current) + len(part) + 2 <= chunk_size:
-            if current:
-                current += "\n\n" + part
-            else:
-                current = part
-
-        else:
-            if current:
-                chunks.append(current.strip())
-
-            if len(part) <= chunk_size:
-                current = part
-            else:
-                # Extremely long paragraph/sentence
-                start = 0
-
-                while start < len(part):
-                    end = start + chunk_size
-                    piece = part[start:end].strip()
-
-                    if piece:
-                        chunks.append(piece)
-
-                    start = end
-
-                current = ""
-
-    if current:
-        chunks.append(current.strip())
-
-    # Add controlled overlap
-    if chunk_overlap > 0 and len(chunks) > 1:
-
-        overlapped = [chunks[0]]
-
-        for i in range(1, len(chunks)):
-
-            previous = chunks[i - 1]
-
-            overlap = previous[-chunk_overlap:].strip()
-
-            if overlap:
-                combined = (
-                    overlap
-                    + "\n\n"
-                    + chunks[i]
-                )
-            else:
-                combined = chunks[i]
-
-            overlapped.append(combined)
-
-        chunks = overlapped
-
-    return chunks
-
-
-# ---------------------------------------------------------
-# MAIN LEGAL CHUNKER
-# ---------------------------------------------------------
-
-def chunk_text(
-    text: str,
-    chunk_size: int = 1200,
-    chunk_overlap: int = 200
-) -> list[str]:
-    """
-    Legal-aware text chunker.
-
-    Designed for Indian legal documents such as:
-
-        303. Theft.—
-        (1) ...
-        (2) ...
-        Provided that ...
-
-    The chunker attempts to keep each legal section together
-    instead of blindly splitting every N characters.
+    Normalize whitespace while preserving paragraph structure.
     """
 
     if not text:
-        return []
-
-    if chunk_size <= 0:
-        raise ValueError(
-            "chunk_size must be greater than 0"
-        )
-
-    if chunk_overlap < 0:
-        raise ValueError(
-            "chunk_overlap cannot be negative"
-        )
-
-    if chunk_overlap >= chunk_size:
-        raise ValueError(
-            "chunk_overlap must be smaller than chunk_size"
-        )
-
-    # -----------------------------------------------------
-    # 1. Normalize whitespace
-    # -----------------------------------------------------
+        return ""
 
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
 
+    # Normalize spaces/tabs.
     text = re.sub(
         r"[ \t]+",
         " ",
         text
     )
 
+    # Avoid excessive blank lines.
     text = re.sub(
         r"\n{3,}",
         "\n\n",
         text
     )
 
+    return text.strip()
+
+
+# ============================================================
+# SECTION HEADER DETECTION
+# ============================================================
+
+SECTION_HEADER_PATTERN = re.compile(
+    r"^\s*(\d{1,4})\.\s+(.+?)\s*$"
+)
+
+
+def _is_section_header(line: str) -> bool:
+    """
+    Return True when a line looks like a legal section heading.
+
+    Examples:
+
+        303. Theft.—
+        318. Cheating.—
+        101. Murder.—
+    """
+
+    if not line:
+        return False
+
+    return bool(
+        SECTION_HEADER_PATTERN.match(
+            line.strip()
+        )
+    )
+
+
+def _extract_section_header(
+    line: str
+) -> Tuple[str, str]:
+    """
+    Extract section number and title.
+
+    Returns:
+        ("303", "Theft.—")
+    """
+
+    match = SECTION_HEADER_PATTERN.match(
+        line.strip()
+    )
+
+    if not match:
+        return "", ""
+
+    section_number = (
+        match.group(1).strip()
+    )
+
+    section_title = (
+        match.group(2).strip()
+    )
+
+    return (
+        section_number,
+        section_title
+    )
+
+
+# ============================================================
+# SPLIT INTO LEGAL SECTIONS
+# ============================================================
+
+def _split_into_sections(
+    text: str
+) -> List[Tuple[str, str, str]]:
+    """
+    Split a legal document into:
+
+        section_number
+        section_title
+        section_text
+
+    Every section keeps its original heading.
+
+    Content before the first detected section is placed in
+    section_number = "".
+    """
+
+    lines = text.splitlines()
+
+    sections = []
+
+    current_section_number = ""
+    current_section_title = ""
+    current_lines = []
+
+    def flush_current() -> None:
+
+        if not current_lines:
+            return
+
+        content = "\n".join(
+            current_lines
+        ).strip()
+
+        if not content:
+            return
+
+        sections.append(
+            (
+                current_section_number,
+                current_section_title,
+                content
+            )
+        )
+
+    for line in lines:
+
+        stripped = line.strip()
+
+        if not stripped:
+            current_lines.append("")
+            continue
+
+        if _is_section_header(stripped):
+
+            # Save previous section.
+            flush_current()
+
+            # Start new section.
+            (
+                current_section_number,
+                current_section_title
+            ) = _extract_section_header(
+                stripped
+            )
+
+            current_lines = [
+                stripped
+            ]
+
+        else:
+
+            current_lines.append(
+                stripped
+            )
+
+    flush_current()
+
+    return sections
+
+
+# ============================================================
+# SPLIT TEXT BY WORD/CHARACTER WINDOW
+# ============================================================
+
+def _split_large_body(
+    text: str,
+    chunk_size: int,
+    chunk_overlap: int
+) -> List[str]:
+    """
+    Split a large section body while trying to stop at
+    sentence/paragraph boundaries.
+    """
+
     text = text.strip()
 
     if not text:
         return []
 
-    # -----------------------------------------------------
-    # 2. Find legal sections
-    # -----------------------------------------------------
+    if len(text) <= chunk_size:
+        return [text]
 
-    matches = list(
-        SECTION_PATTERN.finditer(text)
-    )
+    chunks = []
 
-    # -----------------------------------------------------
-    # 3. If no sections are detected,
-    #    fall back to normal chunking
-    # -----------------------------------------------------
+    start = 0
 
-    if not matches:
-        return _fallback_chunk(
-            text,
-            chunk_size,
-            chunk_overlap
+    text_length = len(text)
+
+    while start < text_length:
+
+        end = min(
+            start + chunk_size,
+            text_length
         )
 
-    sections = []
+        if end < text_length:
 
-    # Text before first section
-    prefix = text[:matches[0].start()].strip()
-
-    if prefix:
-        sections.append({
-            "number": None,
-            "title": None,
-            "text": prefix
-        })
-
-    # -----------------------------------------------------
-    # 4. Extract each legal section
-    # -----------------------------------------------------
-
-    for i, match in enumerate(matches):
-
-        section_number = match.group(1)
-        section_title = match.group(2).strip()
-
-        start = match.start()
-
-        if i + 1 < len(matches):
-            end = matches[i + 1].start()
-        else:
-            end = len(text)
-
-        section_text = text[start:end].strip()
-
-        sections.append({
-            "number": section_number,
-            "title": section_title,
-            "text": section_text
-        })
-
-    # -----------------------------------------------------
-    # 5. Create chunks
-    # -----------------------------------------------------
-
-    final_chunks = []
-
-    for section in sections:
-
-        section_text = section["text"]
-
-        if not section_text:
-            continue
-
-        # Keep complete legal provision together
-        if len(section_text) <= chunk_size:
-
-            final_chunks.append(
-                section_text
+            search_start = max(
+                start,
+                end - 200
             )
 
-        else:
+            candidates = [
+                text.rfind(
+                    ". ",
+                    search_start,
+                    end
+                ),
+                text.rfind(
+                    "; ",
+                    search_start,
+                    end
+                ),
+                text.rfind(
+                    ": ",
+                    search_start,
+                    end
+                ),
+                text.rfind(
+                    "\n",
+                    search_start,
+                    end
+                ),
+                text.rfind(
+                    "।",
+                    search_start,
+                    end
+                ),
+            ]
 
-            # Large section needs splitting
-            split_chunks = _split_large_section(
-                section_text,
-                chunk_size,
-                chunk_overlap
+            boundary = max(
+                candidates
             )
 
-            # Make sure every split chunk retains
-            # section number and title.
-            if section["number"]:
+            if boundary > start:
 
-                header_match = re.match(
-                    r"^\s*(\d{1,4}\.\s+[^\n]+)",
-                    section_text
-                )
+                end = boundary + 1
 
-                if header_match:
-                    header = header_match.group(1).strip()
-
-                    updated_chunks = []
-
-                    for chunk in split_chunks:
-
-                        if not chunk.startswith(
-                            section["number"] + "."
-                        ):
-                            chunk = (
-                                header
-                                + "\n"
-                                + chunk
-                            )
-
-                        updated_chunks.append(
-                            chunk
-                        )
-
-                    split_chunks = updated_chunks
-
-            final_chunks.extend(
-                split_chunks
-            )
-
-    # -----------------------------------------------------
-    # 6. Clean chunks
-    # -----------------------------------------------------
-
-    cleaned_chunks = []
-
-    for chunk in final_chunks:
-
-        chunk = re.sub(
-            r"[ \t]+",
-            " ",
-            chunk
-        )
-
-        chunk = re.sub(
-            r"\n{3,}",
-            "\n\n",
-            chunk
-        )
-
-        chunk = chunk.strip()
+        chunk = text[
+            start:end
+        ].strip()
 
         if chunk:
-            cleaned_chunks.append(
+            chunks.append(
                 chunk
             )
 
-    return cleaned_chunks
+        if end >= text_length:
+            break
+
+        next_start = (
+            end - chunk_overlap
+        )
+
+        if next_start <= start:
+            next_start = end
+
+        start = next_start
+
+    return chunks
 
 
-# ---------------------------------------------------------
-# FALLBACK CHUNKER
-# ---------------------------------------------------------
+# ============================================================
+# CHUNK LEGAL SECTION
+# ============================================================
+
+def _chunk_section(
+    section_number: str,
+    section_title: str,
+    section_text: str,
+    chunk_size: int,
+    chunk_overlap: int
+) -> List[str]:
+    """
+    Chunk one legal section.
+
+    IMPORTANT:
+    Every chunk keeps the legal section heading.
+
+    Example:
+
+        303. Theft.—
+
+    This prevents metadata and legal context from being lost.
+    """
+
+    section_text = section_text.strip()
+
+    if not section_text:
+        return []
+
+    heading = ""
+
+    if section_number:
+
+        heading = (
+            f"{section_number}. "
+            f"{section_title}".strip()
+        )
+
+    # If the section already contains the heading as its first
+    # line, remove it before splitting the body.
+    body_lines = section_text.splitlines()
+
+    if (
+        body_lines
+        and heading
+        and body_lines[0].strip() == heading
+    ):
+
+        body_lines = body_lines[1:]
+
+    body = "\n".join(
+        body_lines
+    ).strip()
+
+    # --------------------------------------------------------
+    # If the heading itself is almost the entire section.
+    # --------------------------------------------------------
+
+    if not body:
+
+        return [
+            heading
+            if heading
+            else section_text
+        ]
+
+    # --------------------------------------------------------
+    # Reserve space for heading.
+    # --------------------------------------------------------
+
+    reserved_heading = (
+        len(heading) + 2
+        if heading
+        else 0
+    )
+
+    effective_chunk_size = max(
+        200,
+        chunk_size - reserved_heading
+    )
+
+    effective_overlap = min(
+        chunk_overlap,
+        max(
+            0,
+            effective_chunk_size // 3
+        )
+    )
+
+    body_chunks = _split_large_body(
+        body,
+        effective_chunk_size,
+        effective_overlap
+    )
+
+    final_chunks = []
+
+    for body_chunk in body_chunks:
+
+        if heading:
+
+            final_chunk = (
+                heading
+                + "\n\n"
+                + body_chunk
+            )
+
+        else:
+
+            final_chunk = body_chunk
+
+        final_chunks.append(
+            final_chunk.strip()
+        )
+
+    return final_chunks
+
+
+# ============================================================
+# FALLBACK PARAGRAPH CHUNKING
+# ============================================================
 
 def _fallback_chunk(
     text: str,
     chunk_size: int,
     chunk_overlap: int
-) -> list[str]:
+) -> List[str]:
     """
-    Fallback chunker for documents where legal
-    section numbers cannot be detected.
+    Fallback for introductory material before the first
+    legal section.
     """
 
     paragraphs = re.split(
@@ -330,37 +439,19 @@ def _fallback_chunk(
         text
     )
 
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in paragraphs
+        if paragraph.strip()
+    ]
+
     chunks = []
+
     current = ""
 
     for paragraph in paragraphs:
 
-        paragraph = paragraph.strip()
-
-        if not paragraph:
-            continue
-
-        if (
-            len(current)
-            + len(paragraph)
-            + 2
-            <= chunk_size
-        ):
-
-            if current:
-                current += (
-                    "\n\n"
-                    + paragraph
-                )
-            else:
-                current = paragraph
-
-        else:
-
-            if current:
-                chunks.append(
-                    current.strip()
-                )
+        if not current:
 
             if len(paragraph) <= chunk_size:
 
@@ -368,84 +459,238 @@ def _fallback_chunk(
 
             else:
 
-                sentences = re.split(
-                    r"(?<=[.!?])\s+",
-                    paragraph
+                large_chunks = _split_large_body(
+                    paragraph,
+                    chunk_size,
+                    chunk_overlap
                 )
 
-                current = ""
+                chunks.extend(
+                    large_chunks
+                )
 
-                for sentence in sentences:
+        elif (
+            len(current)
+            + 2
+            + len(paragraph)
+            <= chunk_size
+        ):
 
-                    sentence = sentence.strip()
+            current = (
+                current
+                + "\n\n"
+                + paragraph
+            )
 
-                    if not sentence:
-                        continue
+        else:
 
-                    if (
-                        len(current)
-                        + len(sentence)
-                        + 1
-                        <= chunk_size
-                    ):
+            chunks.append(
+                current.strip()
+            )
 
-                        if current:
-                            current += (
-                                " "
-                                + sentence
-                            )
-                        else:
-                            current = sentence
+            if chunk_overlap > 0:
 
-                    else:
+                overlap = current[
+                    -chunk_overlap:
+                ]
 
-                        if current:
-                            chunks.append(
-                                current.strip()
-                            )
+                current = (
+                    overlap
+                    + "\n\n"
+                    + paragraph
+                )
 
-                        current = sentence
+                if len(current) > chunk_size:
 
-    if current:
+                    large_chunks = _split_large_body(
+                        current,
+                        chunk_size,
+                        chunk_overlap
+                    )
+
+                    chunks.extend(
+                        large_chunks[:-1]
+                    )
+
+                    current = (
+                        large_chunks[-1]
+                        if large_chunks
+                        else ""
+                    )
+
+            else:
+
+                current = paragraph
+
+    if current.strip():
+
         chunks.append(
             current.strip()
         )
 
-    # -----------------------------------------------------
-    # Controlled overlap
-    # -----------------------------------------------------
+    return chunks
 
-    if (
-        chunk_overlap > 0
-        and len(chunks) > 1
-    ):
 
-        overlapped = [chunks[0]]
+# ============================================================
+# MAIN CHUNK FUNCTION
+# ============================================================
 
-        for i in range(1, len(chunks)):
+def chunk_text(
+    text: str,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
+) -> List[str]:
+    """
+    Legal-aware text chunker.
 
-            previous = chunks[i - 1]
+    The main improvement is that section headings are
+    propagated into every chunk belonging to that section.
+    """
 
-            overlap = previous[
-                -chunk_overlap:
-            ].strip()
+    if not text or not text.strip():
+        return []
 
-            if overlap:
+    if chunk_size <= 0:
+        raise ValueError(
+            "chunk_size must be greater than 0."
+        )
 
-                combined = (
-                    overlap
-                    + "\n\n"
-                    + chunks[i]
-                )
+    if chunk_overlap < 0:
+        raise ValueError(
+            "chunk_overlap cannot be negative."
+        )
 
-            else:
+    if chunk_overlap >= chunk_size:
+        raise ValueError(
+            "chunk_overlap must be smaller than chunk_size."
+        )
 
-                combined = chunks[i]
+    normalized_text = _normalize_text(
+        text
+    )
 
-            overlapped.append(
-                combined
+    if not normalized_text:
+        return []
+
+    sections = _split_into_sections(
+        normalized_text
+    )
+
+    # If no legal sections were detected,
+    # use normal fallback chunking.
+    if not sections:
+        return _fallback_chunk(
+            normalized_text,
+            chunk_size,
+            chunk_overlap
+        )
+
+    final_chunks = []
+
+    for (
+        section_number,
+        section_title,
+        section_text
+    ) in sections:
+
+        # ----------------------------------------------------
+        # Introductory content before first section
+        # ----------------------------------------------------
+
+        if not section_number:
+
+            intro_chunks = _fallback_chunk(
+                section_text,
+                chunk_size,
+                chunk_overlap
             )
 
-        chunks = overlapped
+            final_chunks.extend(
+                intro_chunks
+            )
 
-    return chunks
+            continue
+
+        # ----------------------------------------------------
+        # Legal section
+        # ----------------------------------------------------
+
+        section_chunks = _chunk_section(
+            section_number,
+            section_title,
+            section_text,
+            chunk_size,
+            chunk_overlap
+        )
+
+        final_chunks.extend(
+            section_chunks
+        )
+
+    # --------------------------------------------------------
+    # Final cleanup
+    # --------------------------------------------------------
+
+    cleaned_chunks = []
+
+    for chunk in final_chunks:
+
+        chunk = chunk.strip()
+
+        if not chunk:
+            continue
+
+        # Avoid excessive blank lines.
+        chunk = re.sub(
+            r"\n{3,}",
+            "\n\n",
+            chunk
+        )
+
+        cleaned_chunks.append(
+            chunk
+        )
+
+    return cleaned_chunks
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    sample = """
+    101. Murder.—
+    
+    Except in the cases hereinafter excepted, culpable homicide
+    is murder.
+    
+    Explanation one.
+    
+    102. Punishment.—
+    
+    Whoever commits the offence shall be punished.
+    """
+
+    result = chunk_text(
+        sample,
+        chunk_size=100,
+        chunk_overlap=20
+    )
+
+    print(
+        "Chunks:",
+        len(result)
+    )
+
+    for index, chunk in enumerate(
+        result,
+        start=1
+    ):
+
+        print()
+        print(
+            f"--- CHUNK {index} ---"
+        )
+        print(chunk)

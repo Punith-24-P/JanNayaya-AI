@@ -1,658 +1,1023 @@
 """
-JanNyaya AI - RAG Answer Generation Service
+JanNyaya AI - Grounded RAG Service
 
-Purpose:
-    1. Retrieve relevant legal documents.
-    2. Select the strongest legal evidence.
-    3. Generate a short, grounded legal answer.
-    4. Return clean source information.
+Pipeline:
 
-Design goals:
-    - Short answers
-    - Evidence-grounded responses
-    - No unsupported legal claims
-    - Section-aware answers
-    - Clean source metadata
+    User Question
+         ↓
+    Hybrid Retriever
+         ↓
+    Structured Legal Fact Extractor
+         ↓
+    Compact Legal Context
+         ↓
+    Multilingual LLM
+         ↓
+    Grounded Answer
+         ↓
+    Sources
+
+Supported:
+    English
+    Hindi
+    Kannada
 """
 
 import os
-import re
-from typing import Any
+from typing import List, Dict, Any, Optional
 
-from dotenv import load_dotenv
+from backend.retriever import hybrid_search
 
-from backend.retriever import search_documents
+from backend.legal_fact_extractor import (
+    detect_fact_intent,
+    detect_legal_term,
+    extract_legal_facts,
+    build_fact_context,
+)
 
-
-# ---------------------------------------------------------
-# Environment
-# ---------------------------------------------------------
-
-load_dotenv()
-
-
-# ---------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------
-
-TOP_K_DEFAULT = int(os.getenv("RAG_TOP_K", "5"))
-MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "12000"))
-MAX_SOURCE_TEXT_CHARS = int(os.getenv("RAG_MAX_SOURCE_TEXT_CHARS", "2500"))
+from backend.llm_service import (
+    generate_answer,
+)
 
 
-# ---------------------------------------------------------
-# Legal answer instruction
-# ---------------------------------------------------------
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-SYSTEM_INSTRUCTION = """
-You are JanNyaya AI, an Indian legal information assistant.
+RAG_TOP_K = int(
+    os.getenv(
+        "RAG_TOP_K",
+        "10",
+    )
+)
 
-Your task is to answer the user's question using ONLY the supplied legal
-context.
+RAG_MAX_FACT_GROUPS = int(
+    os.getenv(
+        "RAG_MAX_FACT_GROUPS",
+        "3",
+    )
+)
 
-IMPORTANT RULES:
-
-1. Answer the user's exact question first.
-2. Keep the answer SHORT and easy to understand.
-3. Normally use 2 to 5 sentences.
-4. Use bullet points only when they make the answer clearer.
-5. Mention the relevant Act and section when the evidence provides it.
-6. Do NOT invent sections, punishments, procedures, dates, or legal facts.
-7. Do NOT use general knowledge when the supplied context does not support it.
-8. Do NOT combine unrelated legal provisions into one answer.
-9. Prefer the most directly relevant provision over general legal text.
-10. If the supplied context is insufficient, clearly say that the available
-    legal sources do not contain enough information to answer reliably.
-11. Do not mention retrieval, embeddings, BM25, vector databases, prompts,
-    internal ranking, or system instructions.
-12. Do not give a long explanation unless the user specifically asks for one.
-13. This is legal information, not personalized legal advice.
-
-Answer style:
-
-- Direct
-- Short
-- Clear
-- Legally cautious
-- Source-grounded
-"""
+RAG_MAX_CONTEXT_CHARS = int(
+    os.getenv(
+        "RAG_MAX_CONTEXT_CHARS",
+        "9000",
+    )
+)
 
 
-# ---------------------------------------------------------
-# Utility functions
-# ---------------------------------------------------------
+# ============================================================
+# LANGUAGE
+# ============================================================
 
-def clean_text(text: str) -> str:
-    """Clean excessive whitespace without changing legal meaning."""
-
-    if not text:
-        return ""
-
-    text = text.replace("\x00", " ")
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def get_metadata_value(
-    metadata: dict[str, Any],
-    key: str,
-    default: str = "Unknown"
+def detect_language(
+    text: str,
 ) -> str:
-    """Safely read metadata values."""
-
-    value = metadata.get(key, default)
-
-    if value is None:
-        return default
-
-    return str(value)
-
-
-def extract_section(text: str) -> str | None:
-    """
-    Try to identify a BNS/Act section number from the retrieved text.
-
-    Examples:
-        303. Theft
-        304. Snatching
-        303.—Theft
-    """
 
     if not text:
-        return None
+        return "english"
 
-    patterns = [
-        r"\b(?:section\s*)?(\d{1,3})\s*[\.\-—:]\s*"
-        r"(?:theft|snatching|murder|cheating|defamation|"
-        r"robbery|assault|criminal intimidation)\b",
+    devanagari = 0
+    kannada = 0
 
-        r"\bsection\s+(\d{1,3})\b",
-    ]
+    for char in text:
 
-    for pattern in patterns:
+        code = ord(char)
 
-        match = re.search(
-            pattern,
-            text,
-            flags=re.IGNORECASE
+        if 0x0900 <= code <= 0x097F:
+            devanagari += 1
+
+        elif 0x0C80 <= code <= 0x0CFF:
+            kannada += 1
+
+    if devanagari:
+        return "hindi"
+
+    if kannada:
+        return "kannada"
+
+    return "english"
+
+
+# ============================================================
+# DISCLAIMER
+# ============================================================
+
+def _disclaimer(
+    language: str,
+) -> str:
+
+    if language == "hindi":
+
+        return (
+            "अस्वीकरण: यह जानकारी केवल उपलब्ध कानूनी "
+            "दस्तावेजों पर आधारित है और व्यक्तिगत कानूनी "
+            "सलाह नहीं है।"
         )
 
-        if match:
-            return match.group(1)
+    if language == "kannada":
 
-    return None
+        return (
+            "ಹಕ್ಕುತ್ಯಾಗ: ಈ ಮಾಹಿತಿಯು ಒದಗಿಸಲಾದ ಕಾನೂನು "
+            "ದಾಖಲೆಗಳ ಆಧಾರದ ಮೇಲೆ ಮಾತ್ರ ನೀಡಲಾಗಿದೆ ಮತ್ತು "
+            "ವೈಯಕ್ತಿಕ ಕಾನೂನು ಸಲಹೆಯಲ್ಲ."
+        )
+
+    return (
+        "Disclaimer: This information is based solely on "
+        "the supplied legal documents and is not personalized "
+        "legal advice."
+    )
 
 
-def legal_relevance_score(result: dict[str, Any]) -> float:
+# ============================================================
+# SOURCES
+# ============================================================
+
+def build_sources(
+    results: List[Dict[str, Any]],
+    facts: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     """
-    Obtain the retrieval score used by the retriever.
+    Build clean frontend source objects.
 
-    This function deliberately does NOT create another ranking algorithm.
-    The retriever remains responsible for ranking.
-    """
-
-    score = result.get("score")
-
-    if score is None:
-        score = result.get("retrieval_score", 0.0)
-
-    try:
-        return float(score)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-# ---------------------------------------------------------
-# Evidence selection
-# ---------------------------------------------------------
-
-def select_evidence(
-    results: list[dict[str, Any]],
-    max_results: int = 5
-) -> list[dict[str, Any]]:
-    """
-    Select the strongest retrieved legal evidence.
-
-    We keep this intentionally simple.
-
-    The retriever already performs the ranking. Here we only:
-        - remove empty documents
-        - remove duplicate source/chunk combinations
-        - keep the highest-ranked results
+    Prefer structured legal facts because those represent
+    the final evidence selected for the answer.
     """
 
-    selected = []
+    sources = []
+
+    # --------------------------------------------------------
+    # Structured fact sources
+    # --------------------------------------------------------
+
+    if facts:
+
+        for fact in facts:
+
+            sources.append(
+                {
+                    "section":
+                        fact.get(
+                            "section",
+                            "",
+                        ),
+
+                    "section_title":
+                        fact.get(
+                            "section_title",
+                            "",
+                        ),
+
+                    "source":
+                        fact.get(
+                            "source",
+                            "Unknown",
+                        ),
+
+                    "title":
+                        fact.get(
+                            "title",
+                            "",
+                        ),
+
+                    "document_type":
+                        fact.get(
+                            "document_type",
+                            "",
+                        ),
+
+                    "chunk":
+                        fact.get(
+                            "best_chunk",
+                            None,
+                        ),
+
+                    "score":
+                        round(
+                            float(
+                                fact.get(
+                                    "score",
+                                    0.0,
+                                )
+                            ),
+                            4,
+                        ),
+                }
+            )
+
+        return sources
+
+    # --------------------------------------------------------
+    # Retrieval fallback
+    # --------------------------------------------------------
+
     seen = set()
 
     for result in results:
 
-        text = clean_text(result.get("text", ""))
-
-        if not text:
+        if not isinstance(
+            result,
+            dict,
+        ):
             continue
 
-        metadata = result.get("metadata") or {}
+        metadata = result.get(
+            "metadata",
+            {},
+        )
 
-        source = get_metadata_value(
+        if not isinstance(
             metadata,
+            dict,
+        ):
+            metadata = {}
+
+        section = metadata.get(
+            "section_number",
+            metadata.get(
+                "section",
+                "",
+            ),
+        )
+
+        source = metadata.get(
             "source",
-            "Unknown"
+            "Unknown",
         )
 
-        chunk_index = get_metadata_value(
-            metadata,
-            "chunk_index",
-            "Unknown"
+        key = (
+            f"{source}:"
+            f"{section}"
         )
-
-        key = (source, chunk_index)
 
         if key in seen:
             continue
 
         seen.add(key)
 
-        result_copy = dict(result)
-
-        result_copy["text"] = text
-
-        selected.append(result_copy)
-
-        if len(selected) >= max_results:
-            break
-
-    return selected
-
-
-# ---------------------------------------------------------
-# Context construction
-# ---------------------------------------------------------
-
-def build_context(
-    evidence: list[dict[str, Any]]
-) -> str:
-    """
-    Build a compact legal context for the LLM.
-
-    The context contains:
-        - source
-        - Act
-        - section/chunk
-        - legal text
-    """
-
-    context_parts = []
-    total_chars = 0
-
-    for index, result in enumerate(evidence, start=1):
-
-        metadata = result.get("metadata") or {}
-
-        text = clean_text(
-            result.get("text", "")
+        score = result.get(
+            "hybrid_score",
+            result.get(
+                "score",
+                0.0,
+            ),
         )
 
-        if not text:
-            continue
+        try:
+            score = round(
+                float(score),
+                4,
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            score = 0.0
 
-        source = get_metadata_value(
-            metadata,
-            "source"
-        )
-
-        act_name = get_metadata_value(
-            metadata,
-            "act_name"
-        )
-
-        chunk_index = get_metadata_value(
-            metadata,
-            "chunk_index"
-        )
-
-        section = extract_section(text)
-
-        section_text = (
-            f"Section: {section}"
-            if section
-            else f"Chunk: {chunk_index}"
-        )
-
-        block = (
-            f"SOURCE {index}\n"
-            f"Act: {act_name}\n"
-            f"Source document: {source}\n"
-            f"{section_text}\n"
-            f"Legal text:\n{text}\n"
-        )
-
-        if total_chars + len(block) > MAX_CONTEXT_CHARS:
-            remaining = MAX_CONTEXT_CHARS - total_chars
-
-            if remaining <= 0:
-                break
-
-            block = block[:remaining]
-
-        context_parts.append(block)
-
-        total_chars += len(block)
-
-        if total_chars >= MAX_CONTEXT_CHARS:
-            break
-
-    return "\n-----------------------------\n".join(
-        context_parts
-    )
-
-
-# ---------------------------------------------------------
-# Prompt creation
-# ---------------------------------------------------------
-
-def build_prompt(
-    question: str,
-    context: str
-) -> str:
-    """Create the final grounded prompt."""
-
-    return f"""
-{SYSTEM_INSTRUCTION}
-
-USER QUESTION:
-{question}
-
-LEGAL CONTEXT:
-{context}
-
-Now answer the user's question.
-
-Remember:
-- Answer only from the supplied legal context.
-- Keep it short.
-- Mention the relevant section when supported.
-- Do not include unrelated provisions.
-- Do not invent missing information.
-""".strip()
-
-
-# ---------------------------------------------------------
-# LLM generation
-# ---------------------------------------------------------
-
-def generate_answer_with_llm(
-    question: str,
-    context: str
-) -> str:
-    """
-    Generate an answer using the configured LLM.
-
-    Supported provider:
-        OpenAI-compatible API
-
-    Required environment variables:
-        OPENAI_API_KEY
-        OPENAI_MODEL
-
-    The actual import is performed here so that the retrieval system
-    can still be tested without importing an LLM client at module load.
-    """
-
-    api_key = os.getenv("OPENAI_API_KEY")
-
-    model = os.getenv(
-        "OPENAI_MODEL",
-        "gpt-4o-mini"
-    )
-
-    if not api_key:
-        raise RuntimeError(
-            "OPENAI_API_KEY is not configured. "
-            "Add it to your .env file before using LLM generation."
-        )
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError(
-            "The OpenAI package is not installed. "
-            "Run: pip install openai"
-        ) from exc
-
-    client = OpenAI(
-        api_key=api_key
-    )
-
-    prompt = build_prompt(
-        question,
-        context
-    )
-
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        max_tokens=500,
-        messages=[
+        sources.append(
             {
-                "role": "system",
-                "content": SYSTEM_INSTRUCTION,
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-    )
+                "section":
+                    section,
 
-    answer = response.choices[0].message.content
+                "section_title":
+                    metadata.get(
+                        "section_title",
+                        "",
+                    ),
 
-    if not answer:
-        raise RuntimeError(
-            "The LLM returned an empty answer."
+                "source":
+                    source,
+
+                "title":
+                    metadata.get(
+                        "title",
+                        "",
+                    ),
+
+                "document_type":
+                    metadata.get(
+                        "document_type",
+                        "",
+                    ),
+
+                "chunk":
+                    metadata.get(
+                        "chunk_index",
+                        None,
+                    ),
+
+                "score":
+                    score,
+            }
         )
 
-    return answer.strip()
-
-
-# ---------------------------------------------------------
-# Fallback answer
-# ---------------------------------------------------------
-
-def build_fallback_answer(
-    evidence: list[dict[str, Any]]
-) -> str:
-    """
-    Safe fallback when an LLM is unavailable.
-
-    This does NOT invent a legal answer.
-    It simply exposes the strongest legal evidence.
-    """
-
-    if not evidence:
-        return (
-            "I couldn't find sufficient information in the "
-            "available legal sources to answer this reliably."
-        )
-
-    first = evidence[0]
-
-    metadata = first.get("metadata") or {}
-
-    act_name = get_metadata_value(
-        metadata,
-        "act_name",
-        "the available legal source"
-    )
-
-    source = get_metadata_value(
-        metadata,
-        "source",
-        "unknown source"
-    )
-
-    text = clean_text(
-        first.get("text", "")
-    )
-
-    text = text[:MAX_SOURCE_TEXT_CHARS]
-
-    return (
-        f"Based on {act_name}, the most relevant legal provision "
-        f"available is:\n\n"
-        f"{text}\n\n"
-        f"Source: {source}"
-    )
-
-
-# ---------------------------------------------------------
-# Source formatting
-# ---------------------------------------------------------
-
-def build_sources(
-    evidence: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """
-    Return clean source metadata.
-
-    Only selected evidence is returned as sources.
-    """
-
-    sources = []
-
-    for result in evidence:
-
-        metadata = dict(
-            result.get("metadata") or {}
-        )
-
-        text = clean_text(
-            result.get("text", "")
-        )
-
-        section = extract_section(text)
-
-        retrieval_score = legal_relevance_score(
-            result
-        )
-
-        source = {
-            "source": metadata.get(
-                "source",
-                "Unknown"
-            ),
-            "act_name": metadata.get(
-                "act_name",
-                "Unknown"
-            ),
-            "year": metadata.get(
-                "year",
-                "Unknown"
-            ),
-            "authority": metadata.get(
-                "authority",
-                "Unknown"
-            ),
-            "document_type": metadata.get(
-                "document_type",
-                "Unknown"
-            ),
-            "chunk_index": metadata.get(
-                "chunk_index",
-                "Unknown"
-            ),
-            "section": section,
-            "retrieval_score": round(
-                retrieval_score,
-                4
-            ),
-            "text": text[:MAX_SOURCE_TEXT_CHARS],
-        }
-
-        sources.append(source)
+        if len(sources) >= 5:
+            break
 
     return sources
 
 
-# ---------------------------------------------------------
-# Main RAG function
-# ---------------------------------------------------------
+# ============================================================
+# SIMPLE FACT FALLBACK
+# ============================================================
+
+def _build_fallback_from_facts(
+    question: str,
+    facts: List[Dict[str, Any]],
+) -> str:
+    """
+    Deterministic fallback.
+
+    This is used when Groq is temporarily unavailable.
+
+    It does NOT invent legal information.
+    """
+
+    language = detect_language(
+        question
+    )
+
+    if not facts:
+
+        return (
+            "The available legal documents do not contain "
+            "enough information to answer this question."
+            "\n\n"
+            + _disclaimer(language)
+        )
+
+    fact = facts[0]
+
+    section = str(
+        fact.get(
+            "section",
+            "",
+        )
+    ).strip()
+
+    intent = fact.get(
+        "query_intent",
+        "general",
+    )
+
+    punishment_facts = fact.get(
+        "punishment_facts",
+        [],
+    )
+
+    definition_facts = fact.get(
+        "definition_facts",
+        [],
+    )
+
+    condition_facts = fact.get(
+        "condition_facts",
+        [],
+    )
+
+    # ========================================================
+    # ENGLISH
+    # ========================================================
+
+    if language == "english":
+
+        if intent == "punishment":
+
+            answer = (
+                f"Section {section} of the "
+                f"Bharatiya Nyaya Sanhita, 2023 "
+                f"contains the punishment provision."
+            )
+
+            if punishment_facts:
+
+                answer += (
+                    "\n\n"
+                    + punishment_facts[0]
+                )
+
+            if len(punishment_facts) > 1:
+
+                answer += (
+                    "\n\n"
+                    + punishment_facts[1]
+                )
+
+            if condition_facts:
+
+                answer += (
+                    "\n\n"
+                    + condition_facts[0]
+                )
+
+            return (
+                answer
+                + "\n\n"
+                + _disclaimer(language)
+            )
+
+        if intent == "definition":
+
+            if definition_facts:
+
+                answer = (
+                    f"Section {section} defines the offence "
+                    f"as follows:\n\n"
+                    f"{definition_facts[0]}"
+                )
+
+            else:
+
+                answer = (
+                    f"Section {section} is the relevant "
+                    f"provision for this offence."
+                )
+
+            return (
+                answer
+                + "\n\n"
+                + _disclaimer(language)
+            )
+
+    # ========================================================
+    # HINDI
+    # ========================================================
+
+    if language == "hindi":
+
+        if intent == "punishment":
+
+            answer = (
+                f"धारा {section} में इस अपराध के "
+                f"दंड का प्रावधान है।"
+            )
+
+            if punishment_facts:
+
+                answer += (
+                    "\n\n"
+                    + punishment_facts[0]
+                )
+
+            if len(punishment_facts) > 1:
+
+                answer += (
+                    "\n\n"
+                    + punishment_facts[1]
+                )
+
+            if condition_facts:
+
+                answer += (
+                    "\n\n"
+                    + condition_facts[0]
+                )
+
+            return (
+                answer
+                + "\n\n"
+                + _disclaimer(language)
+            )
+
+        if intent == "definition":
+
+            if definition_facts:
+
+                answer = (
+                    f"धारा {section} के अनुसार:\n\n"
+                    + definition_facts[0]
+                )
+
+            else:
+
+                answer = (
+                    f"धारा {section} इस अपराध से "
+                    f"संबंधित प्रावधान है।"
+                )
+
+            return (
+                answer
+                + "\n\n"
+                + _disclaimer(language)
+            )
+
+    # ========================================================
+    # KANNADA
+    # ========================================================
+
+    if language == "kannada":
+
+        if intent == "punishment":
+
+            answer = (
+                f"ಸೆಕ್ಷನ್ {section} ರಲ್ಲಿ ಈ ಅಪರಾಧದ "
+                f"ಶಿಕ್ಷೆಯ ಬಗ್ಗೆ ನಿಬಂಧನೆ ಇದೆ."
+            )
+
+            if punishment_facts:
+
+                answer += (
+                    "\n\n"
+                    + punishment_facts[0]
+                )
+
+            if len(punishment_facts) > 1:
+
+                answer += (
+                    "\n\n"
+                    + punishment_facts[1]
+                )
+
+            if condition_facts:
+
+                answer += (
+                    "\n\n"
+                    + condition_facts[0]
+                )
+
+            return (
+                answer
+                + "\n\n"
+                + _disclaimer(language)
+            )
+
+        if intent == "definition":
+
+            if definition_facts:
+
+                answer = (
+                    f"ಸೆಕ್ಷನ್ {section} ಪ್ರಕಾರ:\n\n"
+                    + definition_facts[0]
+                )
+
+            else:
+
+                answer = (
+                    f"ಸೆಕ್ಷನ್ {section} ಈ ಅಪರಾಧಕ್ಕೆ "
+                    f"ಸಂಬಂಧಿಸಿದ ನಿಬಂಧನೆಯಾಗಿದೆ."
+                )
+
+            return (
+                answer
+                + "\n\n"
+                + _disclaimer(language)
+            )
+
+    return (
+        "The available legal evidence has been retrieved, "
+        "but a concise answer could not be generated."
+        "\n\n"
+        + _disclaimer(language)
+    )
+
+
+# ============================================================
+# ANSWER QUESTION
+# ============================================================
 
 def answer_question(
     question: str,
-    top_k: int = TOP_K_DEFAULT
-) -> dict[str, Any]:
-    """
-    Main JanNyaya AI RAG function.
-
-    Pipeline:
-
-        Question
-            ↓
-        Hybrid Retriever
-            ↓
-        Evidence Selection
-            ↓
-        Context Construction
-            ↓
-        LLM
-            ↓
-        Short Grounded Answer
-            ↓
-        Sources
-    """
+    history: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
 
     if not question or not question.strip():
 
         return {
-            "answer": (
-                "Please enter a legal question."
-            ),
+            "status": "error",
+            "question": question,
+            "answer": "Please enter a legal question.",
             "sources": [],
         }
 
     question = question.strip()
 
-    # -----------------------------------------------------
-    # 1. Retrieval
-    # -----------------------------------------------------
+    print()
+    print("=" * 70)
+    print("JAN NYAYA AI - GROUNDED RAG QUERY")
+    print("=" * 70)
 
-    results = search_documents(
-        question,
-        top_k=max(top_k, 5)
+    print(
+        f"Question: {question}"
     )
 
-    if not results:
-
-        return {
-            "answer": (
-                "I couldn't find sufficient information in "
-                "the available legal sources to answer this reliably."
-            ),
-            "sources": [],
-        }
-
-    # -----------------------------------------------------
-    # 2. Evidence selection
-    # -----------------------------------------------------
-
-    evidence = select_evidence(
-        results,
-        max_results=min(max(top_k, 5), 5)
+    intent = detect_fact_intent(
+        question
     )
 
-    if not evidence:
-
-        return {
-            "answer": (
-                "I couldn't find sufficient information in "
-                "the available legal sources to answer this reliably."
-            ),
-            "sources": [],
-        }
-
-    # -----------------------------------------------------
-    # 3. Build legal context
-    # -----------------------------------------------------
-
-    context = build_context(
-        evidence
+    legal_term = detect_legal_term(
+        question
     )
 
-    # -----------------------------------------------------
-    # 4. Generate grounded answer
-    # -----------------------------------------------------
+    print()
+    print(
+        f"Detected intent: {intent}"
+    )
+
+    print(
+        f"Detected legal term: {legal_term}"
+    )
+
+    search_query = question
+    if history and isinstance(history, list) and len(history) > 0:
+        recent_user_queries = [
+            str(h.get("content", "")) for h in history if h.get("role") == "user" and str(h.get("content", "")).strip()
+        ]
+        if recent_user_queries:
+            last_query = recent_user_queries[-1]
+            if not legal_term or len(question.split()) < 7 or any(w in question.lower() for w in ["what if", "is it", "can they", "how about", "in this case", "punishment", "bail", "arrest", "penalty", "liable"]):
+                search_query = f"{last_query} {question}"
+                print(f"Contextualized multi-turn search query: {search_query}")
+
+    # ========================================================
+    # RETRIEVAL
+    # ========================================================
+
+    print()
+    print(
+        "Running legal retrieval..."
+    )
 
     try:
 
-        answer = generate_answer_with_llm(
-            question,
-            context
+        results = hybrid_search(
+            search_query,
+            semantic_k=30,
+            bm25_k=30,
+            final_k=RAG_TOP_K,
         )
 
     except Exception as error:
 
+        print()
         print(
-            f"[RAG] LLM generation unavailable: {error}"
+            "RETRIEVAL ERROR:",
+            type(error).__name__,
+            str(error),
         )
 
-        answer = build_fallback_answer(
-            evidence
-        )
+        return {
+            "status": "error",
+            "question": question,
+            "answer": (
+                "An error occurred while retrieving "
+                "the legal documents."
+            ),
+            "sources": [],
+        }
 
-    # -----------------------------------------------------
-    # 5. Sources
-    # -----------------------------------------------------
-
-    sources = build_sources(
-        evidence
+    print(
+        f"Retrieved results: {len(results)}"
     )
 
-    # -----------------------------------------------------
-    # 6. Return final response
-    # -----------------------------------------------------
+    if not results:
+
+        language = detect_language(
+            question
+        )
+
+        return {
+            "status": "success",
+            "question": question,
+            "answer": (
+                "The available legal documents do not "
+                "contain relevant information."
+                "\n\n"
+                + _disclaimer(language)
+            ),
+            "sources": [],
+        }
+
+    # ========================================================
+    # STRUCTURED LEGAL FACTS
+    # ========================================================
+
+    print()
+    print(
+        "Extracting structured legal facts..."
+    )
+
+    try:
+
+        facts = extract_legal_facts(
+            question,
+            results,
+            max_groups=RAG_MAX_FACT_GROUPS,
+        )
+
+    except Exception as error:
+
+        print()
+        print(
+            "FACT EXTRACTION ERROR:",
+            type(error).__name__,
+            str(error),
+        )
+
+        facts = []
+
+    print(
+        f"Extracted legal fact groups: "
+        f"{len(facts)}"
+    )
+
+    # ========================================================
+    # IMPORTANT FALLBACK:
+    #
+    # If extractor somehow returns zero even though retrieval
+    # contains Section 303, create a direct fact from the
+    # strongest retrieved result.
+    # ========================================================
+
+    if not facts and results:
+        print()
+        print("Fact extractor returned 0. Building direct evidence facts from top retrieved results...")
+
+        for result in results[:3]:
+            if not isinstance(result, dict):
+                continue
+            metadata = result.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+
+            sec = str(metadata.get("section_number", "")).strip()
+            title = str(metadata.get("section_title", "")).strip()
+            doc_text = str(result.get("document", "")).strip()
+            if not doc_text:
+                continue
+
+            fallback_fact = {
+                "section": sec,
+                "section_title": title,
+                "source": metadata.get("source", "Official Gazette"),
+                "title": metadata.get("title", metadata.get("act_name", "Statutory Act")),
+                "document_type": metadata.get("document_type", "Act"),
+                "year": metadata.get("year", None),
+                "best_chunk": metadata.get("chunk_index", None),
+                "direct_offence": True,
+                "query_intent": intent,
+                "legal_term": legal_term or metadata.get("route", "general"),
+                "score": float(result.get("legal_rerank_score", result.get("score", 1.0))),
+                "punishment_facts": [],
+                "definition_facts": [doc_text],
+                "condition_facts": [],
+            }
+
+            lower_doc = doc_text.lower()
+            if "shall be punished" in lower_doc or "punished with" in lower_doc or "penalty" in lower_doc:
+                fallback_fact["punishment_facts"] = [doc_text]
+
+            facts.append(fallback_fact)
+
+        if facts:
+            print(f"Direct evidence fallback created with {len(facts)} statutory facts.")
+
+    # ========================================================
+    # STILL NOTHING
+    # ========================================================
+
+    if not facts:
+
+        language = detect_language(
+            question
+        )
+
+        return {
+            "status": "success",
+            "question": question,
+            "answer": (
+                (
+                    "The available legal documents do not "
+                    "contain enough information to answer "
+                    "this question."
+                )
+                + "\n\n"
+                + _disclaimer(language)
+            ),
+            "sources": build_sources(
+                results,
+                [],
+            ),
+        }
+
+    # ========================================================
+    # DEBUG FACTS
+    # ========================================================
+
+    for index, fact in enumerate(
+        facts,
+        start=1,
+    ):
+
+        print()
+        print(
+            f"[FACT {index}]"
+        )
+
+        print(
+            "Section:",
+            fact.get(
+                "section",
+                "",
+            ),
+        )
+
+        print(
+            "Title:",
+            fact.get(
+                "section_title",
+                "",
+            ),
+        )
+
+        print(
+            "Direct:",
+            fact.get(
+                "direct_offence",
+                False,
+            ),
+        )
+
+    # ========================================================
+    # BUILD FACT CONTEXT
+    # ========================================================
+
+    print()
+    print(
+        "Building structured legal context..."
+    )
+
+    context = build_fact_context(
+        facts,
+        max_characters=RAG_MAX_CONTEXT_CHARS,
+    )
+
+    print(
+        f"Fact context characters: "
+        f"{len(context)}"
+    )
+
+    if not context:
+
+        # Deterministic answer without LLM.
+        answer = _build_fallback_from_facts(
+            question,
+            facts,
+        )
+
+        return {
+            "status": "success",
+            "question": question,
+            "answer": answer,
+            "sources": build_sources(
+                results,
+                facts,
+            ),
+        }
+
+    # ========================================================
+    # GENERATE
+    # ========================================================
+
+    print()
+    print(
+        "Generating grounded answer..."
+    )
+
+    try:
+
+        answer = generate_answer(
+            question,
+            context,
+            history=history,
+        )
+
+    except Exception as error:
+
+        print()
+        print(
+            "LLM ERROR:",
+            type(error).__name__,
+            str(error),
+        )
+
+        answer = _build_fallback_from_facts(
+            question,
+            facts,
+        )
+
+    # ========================================================
+    # SAFETY CHECK
+    # ========================================================
+
+    if not answer or not str(answer).strip():
+
+        answer = _build_fallback_from_facts(
+            question,
+            facts,
+        )
+
+    # ========================================================
+    # SOURCES
+    # ========================================================
+
+    sources = build_sources(
+        results,
+        facts,
+    )
+
+    # ========================================================
+    # RESULT
+    # ========================================================
+
+    print()
+    print(
+        "RAG answer generated successfully."
+    )
+
+    print("=" * 70)
 
     return {
-        "answer": answer,
+        "status": "success",
+        "question": question,
+        "answer": str(answer).strip(),
         "sources": sources,
     }
+
+
+# ============================================================
+# COMMAND LINE TEST
+# ============================================================
+
+def main() -> None:
+
+    questions = [
+        "What is the punishment for theft?",
+        "What is theft?",
+        "चोरी की सजा क्या है?",
+        "चोरी क्या है?",
+        "ಕಳ್ಳತನಕ್ಕೆ ಶಿಕ್ಷೆ ಏನು?",
+        "ಕಳ್ಳತನ ಎಂದರೇನು?",
+    ]
+
+    print()
+    print(
+        "JanNyaya AI - Grounded RAG Service Test"
+    )
+
+    for question in questions:
+
+        try:
+
+            result = answer_question(
+                question
+            )
+
+            print()
+            print("=" * 70)
+            print("QUESTION")
+            print("=" * 70)
+            print(
+                result["question"]
+            )
+
+            print()
+            print("=" * 70)
+            print("ANSWER")
+            print("=" * 70)
+            print(
+                result["answer"]
+            )
+
+            print()
+            print("=" * 70)
+            print("SOURCES")
+            print("=" * 70)
+
+            for source in result.get(
+                "sources",
+                [],
+            ):
+
+                print(
+                    f"Section {source.get('section')} | "
+                    f"{source.get('source')} | "
+                    f"Score {source.get('score')}"
+                )
+
+        except Exception as error:
+
+            print()
+            print(
+                "TEST ERROR:",
+                type(error).__name__,
+                str(error),
+            )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()

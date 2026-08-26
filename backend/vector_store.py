@@ -1,105 +1,134 @@
 import hashlib
 from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
 
 import chromadb
 
 
-# =========================================================
+# ============================================================
 # CHROMADB CONFIGURATION
-# =========================================================
+# ============================================================
 
 CHROMA_PATH = Path("chroma_db")
 
 COLLECTION_NAME = "jan_nyaya_documents"
 
 
-# =========================================================
+# ============================================================
 # PERSISTENT CHROMADB CLIENT
-# =========================================================
+# ============================================================
 
 client = chromadb.PersistentClient(
     path=str(CHROMA_PATH)
 )
 
 
-# =========================================================
+# ============================================================
 # LEGAL DOCUMENT COLLECTION
-# =========================================================
+# ============================================================
 
 collection = client.get_or_create_collection(
     name=COLLECTION_NAME
 )
 
 
-# =========================================================
-# ADD CHUNKS
-# =========================================================
+# ============================================================
+# EMPTY SEARCH RESULT
+# ============================================================
+
+def _empty_result() -> dict:
+    """
+    Return a consistent empty ChromaDB result.
+    """
+
+    return {
+        "ids": [[]],
+        "documents": [[]],
+        "metadatas": [[]],
+        "distances": [[]],
+    }
+
+
+# ============================================================
+# CREATE DETERMINISTIC CHUNK ID
+# ============================================================
+
+def _create_chunk_id(
+    document_id: str,
+    chunk_index: int
+) -> str:
+    """
+    Create a deterministic ID for a document chunk.
+    """
+
+    unique_string = (
+        f"{document_id}_{chunk_index}"
+    )
+
+    return hashlib.sha256(
+        unique_string.encode("utf-8")
+    ).hexdigest()
+
+
+# ============================================================
+# ADD / UPSERT CHUNKS
+# ============================================================
 
 def add_chunks(
-    chunks: list[str],
-    metadatas: list[dict] | None = None,
-    embeddings: list[list[float]] | None = None,
+    chunks: List[str],
+    metadatas: Optional[List[dict]] = None,
+    embeddings: Optional[List[List[float]]] = None,
     source: str = "unknown",
 ) -> int:
     """
-    Add legal document chunks to ChromaDB.
+    Add or update legal document chunks in ChromaDB.
 
-    Each chunk receives a deterministic ID based on:
-        source + chunk index + document metadata
-
-    Parameters
-    ----------
-    chunks:
-        Text chunks to store.
-
-    metadatas:
-        Metadata corresponding to each chunk.
-
-    embeddings:
-        Pre-computed embeddings corresponding to each chunk.
-
-    source:
-        Fallback source name.
+    Uses upsert so re-ingesting the same document does not
+    create duplicate records or fail because an ID already
+    exists.
     """
 
     if not chunks:
         return 0
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # Validate metadata
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
     if metadatas is None:
 
         metadatas = [
             {
                 "source": source,
-                "chunk_index": i,
+                "chunk_index": index,
+                "document_id": source,
             }
-            for i in range(len(chunks))
+            for index in range(len(chunks))
         ]
 
     if len(metadatas) != len(chunks):
+
         raise ValueError(
             "Number of metadata entries must match "
             "number of chunks."
         )
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # Validate embeddings
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
     if embeddings is not None:
 
         if len(embeddings) != len(chunks):
+
             raise ValueError(
                 "Number of embeddings must match "
                 "number of chunks."
             )
 
-    # -----------------------------------------------------
+    # --------------------------------------------------------
     # Create IDs
-    # -----------------------------------------------------
+    # --------------------------------------------------------
 
     ids = []
 
@@ -110,20 +139,21 @@ def add_chunks(
             source
         )
 
-        unique_string = (
-            f"{document_id}_"
-            f"{metadata.get('chunk_index', index)}"
+        chunk_index = metadata.get(
+            "chunk_index",
+            index
         )
 
-        chunk_id = hashlib.sha256(
-            unique_string.encode("utf-8")
-        ).hexdigest()
+        chunk_id = _create_chunk_id(
+            str(document_id),
+            int(chunk_index)
+        )
 
         ids.append(chunk_id)
 
-    # -----------------------------------------------------
-    # Prepare metadata
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Clean metadata
+    # --------------------------------------------------------
 
     cleaned_metadatas = []
 
@@ -131,90 +161,90 @@ def add_chunks(
 
         metadata_copy = dict(metadata)
 
-        # Chroma metadata values must be primitive values.
-        # Convert unsupported values to strings.
+        if "source" not in metadata_copy:
+            metadata_copy["source"] = source
 
+        if "chunk_index" not in metadata_copy:
+            metadata_copy["chunk_index"] = index
+
+        if "document_id" not in metadata_copy:
+            metadata_copy["document_id"] = source
+
+        # Chroma metadata supports primitive values.
         for key, value in list(
             metadata_copy.items()
         ):
 
             if value is None:
+
                 metadata_copy[key] = ""
 
             elif not isinstance(
                 value,
                 (str, int, float, bool)
             ):
+
                 metadata_copy[key] = str(value)
-
-        # Ensure chunk index exists
-
-        if "chunk_index" not in metadata_copy:
-            metadata_copy["chunk_index"] = index
 
         cleaned_metadatas.append(
             metadata_copy
         )
 
-    # -----------------------------------------------------
-    # Store in ChromaDB
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Prepare Chroma arguments
+    # --------------------------------------------------------
 
-    add_arguments = {
+    upsert_arguments = {
         "ids": ids,
         "documents": chunks,
         "metadatas": cleaned_metadatas,
     }
 
     if embeddings is not None:
-        add_arguments["embeddings"] = embeddings
 
-    collection.add(
-        **add_arguments
+        upsert_arguments[
+            "embeddings"
+        ] = embeddings
+
+    # --------------------------------------------------------
+    # Store in ChromaDB
+    # --------------------------------------------------------
+
+    collection.upsert(
+        **upsert_arguments
     )
 
     return len(chunks)
 
 
-# =========================================================
-# SEARCH CHUNKS
-# =========================================================
+# ============================================================
+# SEARCH USING CHROMADB'S EMBEDDING FUNCTION
+# ============================================================
 
 def search_chunks(
     query: str,
     n_results: int = 5,
 ) -> dict:
     """
-    Search the legal document collection.
+    Basic ChromaDB text search.
 
-    This function is mainly a basic ChromaDB search.
-    The main hybrid retrieval is handled by retriever.py.
+    Main hybrid retrieval is handled by retriever.py.
     """
 
     if not query or not query.strip():
 
-        return {
-            "documents": [[]],
-            "metadatas": [[]],
-            "distances": [[]],
-        }
+        return _empty_result()
 
     collection_count = collection.count()
 
     if collection_count == 0:
 
-        return {
-            "documents": [[]],
-            "metadatas": [[]],
-            "distances": [[]],
-        }
-
-    # Never request more chunks than available.
+        return _empty_result()
 
     n_results = max(
         1,
         min(
-            n_results,
+            int(n_results),
             collection_count
         )
     )
@@ -232,12 +262,12 @@ def search_chunks(
     return results
 
 
-# =========================================================
-# SEARCH USING EMBEDDINGS
-# =========================================================
+# ============================================================
+# SEARCH USING PRE-COMPUTED EMBEDDING
+# ============================================================
 
 def search_by_embedding(
-    embedding: list[float],
+    embedding: List[float],
     n_results: int = 5,
 ) -> dict:
     """
@@ -245,26 +275,19 @@ def search_by_embedding(
     """
 
     if not embedding:
-        return {
-            "documents": [[]],
-            "metadatas": [[]],
-            "distances": [[]],
-        }
+
+        return _empty_result()
 
     collection_count = collection.count()
 
     if collection_count == 0:
 
-        return {
-            "documents": [[]],
-            "metadatas": [[]],
-            "distances": [[]],
-        }
+        return _empty_result()
 
     n_results = max(
         1,
         min(
-            n_results,
+            int(n_results),
             collection_count
         )
     )
@@ -282,16 +305,17 @@ def search_by_embedding(
     return results
 
 
-# =========================================================
+# ============================================================
 # GET ALL DOCUMENTS
-# =========================================================
+# ============================================================
 
-def get_all_documents() -> tuple[list, list]:
+def get_all_documents() -> Tuple[List[str], List[dict]]:
     """
     Return all documents and metadata from ChromaDB.
     """
 
     if collection.count() == 0:
+
         return [], []
 
     data = collection.get(
@@ -314,9 +338,9 @@ def get_all_documents() -> tuple[list, list]:
     return documents, metadatas
 
 
-# =========================================================
+# ============================================================
 # COLLECTION COUNT
-# =========================================================
+# ============================================================
 
 def get_collection_count() -> int:
     """
@@ -326,17 +350,16 @@ def get_collection_count() -> int:
     return collection.count()
 
 
-# =========================================================
-# DELETE ALL DOCUMENTS
-# =========================================================
+# ============================================================
+# CLEAR COLLECTION
+# ============================================================
 
 def clear_collection() -> None:
     """
     Delete every chunk from the current collection.
 
-    IMPORTANT:
-    Use this only when intentionally rebuilding the
-    knowledge base.
+    WARNING:
+    This deletes the complete legal knowledge base.
     """
 
     global collection
@@ -349,10 +372,14 @@ def clear_collection() -> None:
         name=COLLECTION_NAME
     )
 
+    print(
+        "ChromaDB collection cleared successfully."
+    )
 
-# =========================================================
+
+# ============================================================
 # DELETE DOCUMENT
-# =========================================================
+# ============================================================
 
 def delete_document(
     document_id: str,
@@ -388,3 +415,24 @@ def delete_document(
     )
 
     return len(ids)
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "JanNyaya AI Vector Store"
+    )
+
+    print(
+        "Collection:",
+        COLLECTION_NAME
+    )
+
+    print(
+        "Stored chunks:",
+        get_collection_count()
+    )
