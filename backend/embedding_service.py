@@ -1,7 +1,21 @@
-from typing import List
+import os
+import gc
+from typing import List, Optional
 
-from sentence_transformers import SentenceTransformer
+# Force low-memory CPU single-thread footprint for cloud deployment
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["TORCH_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["MALLOC_TRIM_THRESHOLD_"] = "100000"
 
+import torch
+torch.set_grad_enabled(False)
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except Exception:
+    pass
 
 # ============================================================
 # GLOBAL MODEL
@@ -21,31 +35,29 @@ EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 # LOAD EMBEDDING MODEL
 # ============================================================
 
-def get_embedding_model() -> SentenceTransformer:
+def get_embedding_model():
     """
-    Load the multilingual SentenceTransformer model.
-
-    The model is loaded only once and reused for all
-    subsequent embedding requests.
+    Load the multilingual SentenceTransformer model in low-memory mode.
+    The model is loaded only once and reused for all subsequent requests.
     """
-
     global _model
 
     if _model is None:
-
-        print("=" * 60)
-        print("Loading multilingual embedding model...")
-        print(f"Model: {EMBEDDING_MODEL_NAME}")
-
-        _model = SentenceTransformer(
-            EMBEDDING_MODEL_NAME
-        )
-
-        print(
-            "Multilingual embedding model loaded successfully."
-        )
-
-        print("=" * 60)
+        try:
+            print("=" * 60)
+            print("Loading lightweight multilingual embedding model...")
+            print(f"Model: {EMBEDDING_MODEL_NAME}")
+            from sentence_transformers import SentenceTransformer
+            _model = SentenceTransformer(
+                EMBEDDING_MODEL_NAME,
+                device="cpu",
+            )
+            _model.eval()
+            print("Multilingual embedding model loaded successfully in low-memory mode.")
+            print("=" * 60)
+        except Exception as e:
+            print(f"Notice: Neural embedding fallback: {e}")
+            _model = None
 
     return _model
 
@@ -99,11 +111,9 @@ def create_embeddings(
 ) -> List[List[float]]:
     """
     Create multilingual passage embeddings.
-
     These embeddings are intended for stored legal documents,
     sections, judgments, reports, and other knowledge-base text.
     """
-
     if not texts:
         return []
 
@@ -113,15 +123,21 @@ def create_embeddings(
     ]
 
     model = get_embedding_model()
+    if model is None:
+        return []
 
-    embeddings = model.encode(
-        prepared_texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-
-    return embeddings.tolist()
+    try:
+        with torch.inference_mode():
+            embeddings = model.encode(
+                prepared_texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+        return embeddings.tolist()
+    except Exception as e:
+        print(f"Embedding generation error: {e}")
+        return []
 
 
 # ============================================================
@@ -133,29 +149,34 @@ def create_embedding(
 ) -> List[float]:
     """
     Create a multilingual query embedding.
-
     This is used for user questions such as English,
     Hindi, Kannada, etc.
     """
-
     prepared_text = _prepare_query(text)
 
     if not prepared_text:
         return []
 
     model = get_embedding_model()
-
-    embedding = model.encode(
-        [prepared_text],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False,
-    )
-
-    if embedding is None or len(embedding) == 0:
+    if model is None:
         return []
 
-    return embedding[0].tolist()
+    try:
+        with torch.inference_mode():
+            embedding = model.encode(
+                [prepared_text],
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+
+        if embedding is None or len(embedding) == 0:
+            return []
+
+        return embedding[0].tolist()
+    except Exception as e:
+        print(f"Query embedding generation error: {e}")
+        return []
 
 
 def test_embedding_model() -> bool:

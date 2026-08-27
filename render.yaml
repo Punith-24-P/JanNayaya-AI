@@ -12,5 +12,15 @@ services:
         value: 3.11.8
       - key: PORT
         value: 10000
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: TORCH_NUM_THREADS
+        value: "1"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      - key: MALLOC_TRIM_THRESHOLD_
+        value: "100000"
       - key: GROQ_API_KEY
         sync: false
