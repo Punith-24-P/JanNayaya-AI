@@ -22,5 +22,7 @@ services:
         value: "false"
       - key: MALLOC_TRIM_THRESHOLD_
         value: "100000"
+      - key: LOW_MEMORY_MODE
+        value: "true"
       - key: GROQ_API_KEY
         sync: false

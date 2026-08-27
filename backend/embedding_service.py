@@ -9,19 +9,12 @@ os.environ["TORCH_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["MALLOC_TRIM_THRESHOLD_"] = "100000"
 
-import torch
-torch.set_grad_enabled(False)
-torch.set_num_threads(1)
-try:
-    torch.set_num_interop_threads(1)
-except Exception:
-    pass
-
 # ============================================================
 # GLOBAL MODEL
 # ============================================================
 
 _model = None
+_torch_loaded = False
 
 
 # ============================================================
@@ -39,24 +32,39 @@ def get_embedding_model():
     """
     Load the multilingual SentenceTransformer model in low-memory mode.
     The model is loaded only once and reused for all subsequent requests.
+    If memory is constrained (Render 512MB), gracefully returns None so
+    BM25 and statutory retrieval take over with 0MB memory overhead.
     """
-    global _model
+    global _model, _torch_loaded
+
+    # Check if low-memory mode is explicitly requested
+    if os.getenv("LOW_MEMORY_MODE", "").lower() in ["1", "true", "yes"]:
+        return None
 
     if _model is None:
         try:
             print("=" * 60)
             print("Loading lightweight multilingual embedding model...")
             print(f"Model: {EMBEDDING_MODEL_NAME}")
+            import torch
+            torch.set_grad_enabled(False)
+            torch.set_num_threads(1)
+            try:
+                torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+
             from sentence_transformers import SentenceTransformer
             _model = SentenceTransformer(
                 EMBEDDING_MODEL_NAME,
                 device="cpu",
             )
             _model.eval()
+            _torch_loaded = True
             print("Multilingual embedding model loaded successfully in low-memory mode.")
             print("=" * 60)
         except Exception as e:
-            print(f"Notice: Neural embedding fallback: {e}")
+            print(f"Notice: Neural embedding fallback to high-speed BM25 statutory engine: {e}")
             _model = None
 
     return _model
@@ -127,6 +135,7 @@ def create_embeddings(
         return []
 
     try:
+        import torch
         with torch.inference_mode():
             embeddings = model.encode(
                 prepared_texts,
@@ -162,6 +171,7 @@ def create_embedding(
         return []
 
     try:
+        import torch
         with torch.inference_mode():
             embedding = model.encode(
                 [prepared_text],
