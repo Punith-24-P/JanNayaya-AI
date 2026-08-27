@@ -10,9 +10,6 @@ backend/venv/
 __pycache__/
 *.py[cod]
 
-# ChromaDB local database
-chroma_db/
-
 # Uploaded files
 uploads/
 
