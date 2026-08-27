@@ -39,12 +39,10 @@ load_dotenv(
 # CONFIGURATION
 # ============================================================
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 if not GROQ_API_KEY:
-    raise RuntimeError(
-        "GROQ_API_KEY is missing from .env"
-    )
+    print("Warning: GROQ_API_KEY environment variable is not set. LLM calls will require an API key.")
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -72,7 +70,7 @@ MAX_TOKENS = int(
 # ============================================================
 
 client = Groq(
-    api_key=GROQ_API_KEY,
+    api_key=GROQ_API_KEY or "gsk_placeholder",
     timeout=60.0,
 )
 

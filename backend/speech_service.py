@@ -42,14 +42,10 @@ load_dotenv(
 # CONFIGURATION
 # ============================================================
 
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY"
-)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 if not GROQ_API_KEY:
-    raise RuntimeError(
-        "GROQ_API_KEY is missing from .env"
-    )
+    print("Warning: GROQ_API_KEY environment variable is not set. Speech calls will require an API key.")
 
 
 SPEECH_MODEL = os.getenv(
@@ -63,7 +59,7 @@ SPEECH_MODEL = os.getenv(
 # ============================================================
 
 client = Groq(
-    api_key=GROQ_API_KEY,
+    api_key=GROQ_API_KEY or "gsk_placeholder",
     timeout=120.0,
 )
 
