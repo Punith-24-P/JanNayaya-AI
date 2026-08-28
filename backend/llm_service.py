@@ -1076,8 +1076,8 @@ def generate_answer(
                             "role": str(h.get("role", "user")),
                             "content": str(h.get("content", "")),
                         }
-                        for h in (history or [])[-6:]
-                        if h.get("content", "").strip()
+                        for h in (history if isinstance(history, list) else [])[-6:]
+                        if isinstance(h, dict) and h.get("content", "").strip()
                     ]
                     + [
                         {

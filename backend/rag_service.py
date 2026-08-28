@@ -26,18 +26,24 @@ Supported:
 import os
 from typing import List, Dict, Any, Optional
 
-from backend.retriever import hybrid_search
-
-from backend.legal_fact_extractor import (
-    detect_fact_intent,
-    detect_legal_term,
-    extract_legal_facts,
-    build_fact_context,
-)
-
-from backend.llm_service import (
-    generate_answer,
-)
+try:
+    from backend.retriever import hybrid_search
+    from backend.legal_fact_extractor import (
+        detect_fact_intent,
+        detect_legal_term,
+        extract_legal_facts,
+        build_fact_context,
+    )
+    from backend.llm_service import generate_answer
+except ImportError:
+    from retriever import hybrid_search
+    from legal_fact_extractor import (
+        detect_fact_intent,
+        detect_legal_term,
+        extract_legal_facts,
+        build_fact_context,
+    )
+    from llm_service import generate_answer
 
 
 # ============================================================
@@ -578,8 +584,11 @@ def _build_fallback_from_facts(
 
 def answer_question(
     question: str,
-    history: Optional[List[Dict[str, str]]] = None,
+    history: Optional[Any] = None,
 ) -> Dict[str, Any]:
+
+    if not isinstance(history, list):
+        history = []
 
     if not question or not question.strip():
 

@@ -55,14 +55,10 @@ load_dotenv(
 # CONFIGURATION
 # ============================================================
 
-GROQ_API_KEY = os.getenv(
-    "GROQ_API_KEY"
-)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 if not GROQ_API_KEY:
-    raise ValueError(
-        "GROQ_API_KEY is missing from .env"
-    )
+    print("Notice: GROQ_API_KEY is not set in environment. Document analysis will require API key.")
 
 GROQ_MODEL = os.getenv(
     "GROQ_MODEL",
@@ -89,7 +85,7 @@ DOCUMENT_ANALYSIS_MAX_CHARS = int(
 # ============================================================
 
 client = Groq(
-    api_key=GROQ_API_KEY,
+    api_key=GROQ_API_KEY or "gsk_placeholder",
     timeout=60.0,
 )
 

@@ -366,21 +366,32 @@ export default function App() {
   // Auth & Profile State
   const [user, setUser] = useState(() => {
     try {
-      const saved = localStorage.getItem("jannyaya_user");
+      const saved = localStorage.getItem("jannyaya_user") || sessionStorage.getItem("jannyaya_user");
       return saved ? JSON.parse(saved) : null;
     } catch {
       return null;
     }
   });
-  const [token, setToken] = useState(() => localStorage.getItem("jannyaya_token") || "");
+  const [token, setToken] = useState(() => localStorage.getItem("jannyaya_token") || sessionStorage.getItem("jannyaya_token") || "");
+  const [isGuest, setIsGuest] = useState(() => sessionStorage.getItem("jannyaya_is_guest") === "true");
+  const [guestQuestionsLeft, setGuestQuestionsLeft] = useState(() => {
+    const saved = sessionStorage.getItem("jannyaya_guest_quota");
+    return saved !== null ? parseInt(saved, 10) : 5;
+  });
+  const [showTrialLimitModal, setShowTrialLimitModal] = useState(false);
   const [showAuthModal, setShowAuthModal] = useState(false);
-  const [authMode, setAuthMode] = useState("login");
+  const [authMode, setAuthMode] = useState("login"); // "login" | "register"
   const [authUsername, setAuthUsername] = useState("");
   const [authPassword, setAuthPassword] = useState("");
+  const [authConfirmPassword, setAuthConfirmPassword] = useState("");
   const [authFullName, setAuthFullName] = useState("");
   const [authEmail, setAuthEmail] = useState("");
   const [authError, setAuthError] = useState("");
   const [authLoading, setAuthLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPasswordAuth, setShowConfirmPasswordAuth] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
+  const [acceptTerms, setAcceptTerms] = useState(true);
 
   // Profile Edit Modal State
   const [showProfileModal, setShowProfileModal] = useState(false);
@@ -601,20 +612,43 @@ export default function App() {
   // ============================================================
 
   const handleAuthSubmit = async (e) => {
-    e.preventDefault();
+    if (e) e.preventDefault();
     setAuthError("");
     setAuthLoading(true);
+
+    if (authMode === "register") {
+      if (!authUsername.trim()) {
+        setAuthError("Username is required.");
+        setAuthLoading(false);
+        return;
+      }
+      if (authPassword.length < 4) {
+        setAuthError("Password must be at least 4 characters.");
+        setAuthLoading(false);
+        return;
+      }
+      if (authPassword !== authConfirmPassword) {
+        setAuthError("Passwords do not match. Please re-enter.");
+        setAuthLoading(false);
+        return;
+      }
+      if (!acceptTerms) {
+        setAuthError("Please accept the terms and privacy statement.");
+        setAuthLoading(false);
+        return;
+      }
+    }
 
     try {
       const endpoint = authMode === "login" ? "/auth/login" : "/auth/register";
       const payload =
         authMode === "login"
-          ? { username: authUsername, password: authPassword }
+          ? { username: authUsername.trim(), password: authPassword }
           : {
-              username: authUsername,
+              username: authUsername.trim(),
               password: authPassword,
-              full_name: authFullName || authUsername,
-              email: authEmail || "",
+              full_name: authFullName.trim() || authUsername.trim(),
+              email: authEmail.trim() || "",
               language: uiLang,
             };
 
@@ -625,13 +659,21 @@ export default function App() {
       });
 
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Authentication failed");
+      if (!res.ok) throw new Error(data.detail || "Authentication failed. Please verify credentials.");
 
       setToken(data.token);
       setUser(data.user);
-      localStorage.setItem("jannyaya_token", data.token);
-      localStorage.setItem("jannyaya_user", JSON.stringify(data.user));
+      setIsGuest(false);
+      sessionStorage.removeItem("jannyaya_is_guest");
+      if (rememberMe) {
+        localStorage.setItem("jannyaya_token", data.token);
+        localStorage.setItem("jannyaya_user", JSON.stringify(data.user));
+      } else {
+        sessionStorage.setItem("jannyaya_token", data.token);
+        sessionStorage.setItem("jannyaya_user", JSON.stringify(data.user));
+      }
       setShowAuthModal(false);
+      setShowTrialLimitModal(false);
       loadConversations();
     } catch (err) {
       setAuthError(err.message || "Failed to authenticate.");
@@ -640,12 +682,45 @@ export default function App() {
     }
   };
 
-  const handleLogout = () => {
+  const handleStartGuestTrial = () => {
+    setIsGuest(true);
+    sessionStorage.setItem("jannyaya_is_guest", "true");
+    if (sessionStorage.getItem("jannyaya_guest_quota") === null) {
+      sessionStorage.setItem("jannyaya_guest_quota", "5");
+      setGuestQuestionsLeft(5);
+    }
+    setShowAuthModal(false);
+    setShowTrialLimitModal(false);
+  };
+
+  const handleLogout = async () => {
+    try {
+      if (token) {
+        await fetch(`${API_BASE}/auth/logout`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      }
+    } catch (e) {
+      console.warn("Logout notification error:", e);
+    }
     setToken("");
     setUser(null);
+    setIsGuest(false);
     localStorage.removeItem("jannyaya_token");
     localStorage.removeItem("jannyaya_user");
-    loadConversations();
+    sessionStorage.clear();
+    setConversations([]);
+    setActiveSessionId(null);
+    setActiveConvMeta(null);
+    setChatMessages([
+      {
+        role: "assistant",
+        text: "Namaste. I am **JanNyaya AI**, your conversational legal intelligence assistant for Indian Law.\n\nYou can ask any legal question regarding banking regulations, criminal laws (BNS, BNSS, BSA), civil recovery, consumer rights, cyber law, property disputes, labour rights, or upload and analyze case files in English, हिन्दी, or ಕನ್ನಡ.",
+        sources: [],
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+      },
+    ]);
   };
 
   const handleAvatarChange = (e) => {
@@ -907,6 +982,19 @@ export default function App() {
   const handleSendQuestion = async (queryOverride = null) => {
     const q = (queryOverride || question).trim();
     if (!q || loadingQA) return;
+
+    if (isGuest && guestQuestionsLeft <= 0) {
+      setShowTrialLimitModal(true);
+      return;
+    }
+
+    if (isGuest) {
+      setGuestQuestionsLeft((prev) => {
+        const next = Math.max(0, prev - 1);
+        sessionStorage.setItem("jannyaya_guest_quota", next.toString());
+        return next;
+      });
+    }
 
     setQuestion("");
     setQaError("");
@@ -1475,6 +1563,285 @@ export default function App() {
     return matchesTerm && matchesLang;
   });
 
+  // ============================================================
+  // MANDATORY FIRST SCREEN: AUTHENTICATION PORTAL
+  // ============================================================
+  if (!user && !isGuest) {
+    return (
+      <div className="auth-portal-fullscreen" data-theme={themeAccent}>
+        <div className="auth-portal-bg-decor" />
+        <div className="auth-portal-ambient-glow" />
+
+        <div className="auth-portal-container">
+          {/* Left Hero Showcase */}
+          <div className="auth-hero-showcase">
+            <div className="auth-hero-brand">
+              <div className="auth-hero-logo-box">
+                <Scale size={28} />
+              </div>
+              <div>
+                <div className="auth-hero-title">JanNyaya AI</div>
+                <div className="auth-hero-subtitle">Indian Legal Intelligence</div>
+              </div>
+            </div>
+
+            <div className="auth-hero-pitch">
+              <div className="auth-hero-tagline-box">
+                <div className="auth-hero-tagline-en">
+                  “Understand Indian Law. In Your Language.”
+                </div>
+                <div className="auth-hero-tagline-sub">
+                  भारतीय कानून को अपनी भाषा में समझें • ನಿಮ್ಮ ಭಾಷೆಯಲ್ಲಿ ಭಾರತೀಯ ಕಾನೂನನ್ನು ಅರ್ಥಮಾಡಿಕೊಳ್ಳಿ
+                </div>
+              </div>
+
+              <div className="auth-hero-features-list">
+                <div className="auth-feature-pill">
+                  <BookOpen size={16} />
+                  <span>BNS, BNSS & BSA 2023</span>
+                </div>
+                <div className="auth-feature-pill">
+                  <FileText size={16} />
+                  <span>Multi-Document Studio</span>
+                </div>
+                <div className="auth-feature-pill">
+                  <Mic size={16} />
+                  <span>Multilingual Voice & OCR</span>
+                </div>
+                <div className="auth-feature-pill">
+                  <ShieldCheck size={16} />
+                  <span>100% Grounded Statutory RAG</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="auth-hero-footer-stat">
+              <span>Authoritative Statutory Knowledge Base</span>
+              <span className="auth-hero-stat-badge">
+                <Sparkles size={13} />
+                5,142+ Legal Provisions
+              </span>
+            </div>
+          </div>
+
+          {/* Right Auth Card Panel */}
+          <div className="auth-form-panel">
+            <div className="auth-tabs-header">
+              <button
+                className={`auth-tab-toggle-btn ${authMode === "login" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("login");
+                  setAuthError("");
+                }}
+                type="button"
+              >
+                <LogIn size={15} />
+                <span>Sign In</span>
+              </button>
+              <button
+                className={`auth-tab-toggle-btn ${authMode === "register" ? "active" : ""}`}
+                onClick={() => {
+                  setAuthMode("register");
+                  setAuthError("");
+                }}
+                type="button"
+              >
+                <UserPlus size={15} />
+                <span>Create Account</span>
+              </button>
+            </div>
+
+            <form className="auth-form-body" onSubmit={handleAuthSubmit}>
+              {authError && (
+                <div className="auth-error-banner" role="alert">
+                  <AlertTriangle size={15} />
+                  <span>{authError}</span>
+                </div>
+              )}
+
+              {authMode === "register" && (
+                <div className="auth-input-group">
+                  <label className="auth-input-label">Full Name</label>
+                  <div className="auth-input-wrapper">
+                    <User size={16} className="auth-input-icon" />
+                    <input
+                      type="text"
+                      className="auth-text-field"
+                      placeholder="e.g. Adv. Rajesh Sharma"
+                      value={authFullName}
+                      onChange={(e) => setAuthFullName(e.target.value)}
+                      required
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div className="auth-input-group">
+                <label className="auth-input-label">
+                  {authMode === "login" ? "Username or Email" : "Choose Username"}
+                </label>
+                <div className="auth-input-wrapper">
+                  <User size={16} className="auth-input-icon" />
+                  <input
+                    type="text"
+                    className="auth-text-field"
+                    placeholder="Enter your username"
+                    value={authUsername}
+                    onChange={(e) => setAuthUsername(e.target.value)}
+                    required
+                    autoFocus
+                  />
+                </div>
+              </div>
+
+              {authMode === "register" && (
+                <div className="auth-input-group">
+                  <label className="auth-input-label">Preferred Legal Language</label>
+                  <div className="auth-input-wrapper">
+                    <Globe size={16} className="auth-input-icon" />
+                    <select
+                      className="auth-text-field"
+                      value={uiLang}
+                      onChange={(e) => setUiLang(e.target.value)}
+                      style={{ appearance: "auto" }}
+                    >
+                      <option value="english">English (Official Indian Statutes)</option>
+                      <option value="hindi">हिन्दी (हिंदी कानूनी सहायता)</option>
+                      <option value="kannada">ಕನ್ನಡ (ಕನ್ನಡ ಕಾನೂನು ನೆರವು)</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              <div className="auth-input-group">
+                <label className="auth-input-label">Password</label>
+                <div className="auth-input-wrapper">
+                  <Lock size={16} className="auth-input-icon" />
+                  <input
+                    type={showPassword ? "text" : "password"}
+                    className="auth-text-field"
+                    placeholder="••••••••"
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    required
+                  />
+                  <button
+                    type="button"
+                    className="auth-password-toggle-btn"
+                    onClick={() => setShowPassword(!showPassword)}
+                    title={showPassword ? "Hide password" : "Show password"}
+                  >
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+                {authMode === "register" && (
+                  <div className="auth-pwd-strength-bar">
+                    <div
+                      className={`auth-pwd-strength-fill ${
+                        authPassword.length >= 8 ? "strong" : authPassword.length >= 5 ? "medium" : "weak"
+                      }`}
+                    />
+                  </div>
+                )}
+              </div>
+
+              {authMode === "register" && (
+                <div className="auth-input-group">
+                  <label className="auth-input-label">Confirm Password</label>
+                  <div className="auth-input-wrapper">
+                    <Lock size={16} className="auth-input-icon" />
+                    <input
+                      type={showConfirmPasswordAuth ? "text" : "password"}
+                      className="auth-text-field"
+                      placeholder="••••••••"
+                      value={authConfirmPassword}
+                      onChange={(e) => setAuthConfirmPassword(e.target.value)}
+                      required
+                    />
+                    <button
+                      type="button"
+                      className="auth-password-toggle-btn"
+                      onClick={() => setShowConfirmPasswordAuth(!showConfirmPasswordAuth)}
+                      title={showConfirmPasswordAuth ? "Hide password" : "Show password"}
+                    >
+                      {showConfirmPasswordAuth ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="auth-row-options">
+                <label className="auth-checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={rememberMe}
+                    onChange={(e) => setRememberMe(e.target.checked)}
+                  />
+                  <span>Remember me</span>
+                </label>
+                {authMode === "login" ? (
+                  <button
+                    type="button"
+                    className="auth-link-btn"
+                    onClick={() =>
+                      alert("To reset your password, contact your administrator or change it in profile settings after login.")
+                    }
+                  >
+                    Forgot password?
+                  </button>
+                ) : (
+                  <label className="auth-checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={acceptTerms}
+                      onChange={(e) => setAcceptTerms(e.target.checked)}
+                      required
+                    />
+                    <span>I agree to Legal Terms</span>
+                  </label>
+                )}
+              </div>
+
+              <button
+                type="submit"
+                className="auth-submit-primary-btn"
+                disabled={authLoading}
+              >
+                {authLoading ? (
+                  <>
+                    <RefreshCw size={16} className="spinning" />
+                    <span>Processing...</span>
+                  </>
+                ) : authMode === "login" ? (
+                  <>
+                    <LogIn size={16} />
+                    <span>Sign In to JanNyaya AI</span>
+                  </>
+                ) : (
+                  <>
+                    <UserPlus size={16} />
+                    <span>Create Citizen Account</span>
+                  </>
+                )}
+              </button>
+
+              <div className="auth-divider-or">or explore without registration</div>
+
+              <button
+                type="button"
+                className="auth-guest-trial-btn"
+                onClick={handleStartGuestTrial}
+              >
+                <Sparkles size={15} />
+                <span>⚡ Continue as Guest / Start Free Trial</span>
+              </button>
+            </form>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="jannyaya-app-container" data-theme={themeAccent}>
       {/* Mobile Drawer Backdrop Overlay */}
@@ -1690,6 +2057,27 @@ export default function App() {
 
       {/* Main App Workspace */}
       <main className="jannyaya-workspace-viewport">
+        {/* Guest Trial Active Top Banner */}
+        {isGuest && (
+          <div className="guest-trial-top-banner" role="status">
+            <div className="guest-trial-info-text">
+              <Sparkles size={14} style={{ color: "#facc15" }} />
+              <span>
+                <strong>Guest Trial Session:</strong> You have <strong>{guestQuestionsLeft}</strong>/5 trial legal questions remaining.
+              </span>
+            </div>
+            <button
+              className="guest-trial-create-btn"
+              onClick={() => {
+                setAuthMode("register");
+                setShowAuthModal(true);
+              }}
+            >
+              Create Account to Save Consultations
+            </button>
+          </div>
+        )}
+
         {/* Top Header Bar with Persistent Reopen Button */}
         <header className="workspace-top-header">
           <div className="header-left-side">
@@ -3691,6 +4079,43 @@ export default function App() {
             <div className="prov-modal-footer">
               <button className="prov-modal-done-btn" onClick={() => setSelectedSourceModal(null)}>
                 Close Reference
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Guest Trial Limit Exceeded Modal */}
+      {showTrialLimitModal && (
+        <div className="modal-backdrop-overlay" onClick={() => setShowTrialLimitModal(false)}>
+          <div className="trial-limit-dialog-box" onClick={(e) => e.stopPropagation()}>
+            <div className="trial-limit-icon">
+              <Sparkles size={28} />
+            </div>
+            <div className="trial-limit-title">Guest Trial Limit Reached</div>
+            <div className="trial-limit-desc">
+              You have completed your 5 free trial legal questions. Create a free citizen account or log in to unlock unlimited consultations, multi-document case analysis, and permanent case dossier storage.
+            </div>
+            <div className="trial-limit-actions">
+              <button
+                className="trial-limit-action-btn primary"
+                onClick={() => {
+                  setShowTrialLimitModal(false);
+                  setAuthMode("register");
+                  setShowAuthModal(true);
+                }}
+              >
+                Create Free Account
+              </button>
+              <button
+                className="trial-limit-action-btn secondary"
+                onClick={() => {
+                  setShowTrialLimitModal(false);
+                  setAuthMode("login");
+                  setShowAuthModal(true);
+                }}
+              >
+                Sign In
               </button>
             </div>
           </div>

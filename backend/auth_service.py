@@ -244,6 +244,35 @@ def login_user(username: str, password: str) -> Dict[str, Any]:
         conn.close()
 
 
+def logout_user(token: str) -> bool:
+    """Invalidate active session token on logout."""
+    if not token:
+        return False
+    conn = _get_db()
+    try:
+        with conn:
+            conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        return True
+    except Exception as e:
+        print(f"Logout error: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def get_user_from_auth_header(auth_header: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Helper to extract token from Authorization header and return authenticated user dict."""
+    if not auth_header:
+        return None
+    parts = auth_header.strip().split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        token = parts[1]
+        return get_user_from_token(token)
+    elif len(parts) == 1 and not parts[0].lower().startswith("bearer"):
+        return get_user_from_token(parts[0])
+    return None
+
+
 def get_user_from_token(token: str) -> Optional[Dict[str, Any]]:
     if not token:
         return None
@@ -680,15 +709,14 @@ def list_conversations(
     search: Optional[str] = None,
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
-    """List recent consultations matching data model specifications."""
+    """List recent consultations strictly isolated by user_id."""
+    if user_id is None:
+        return []
+
     conn = _get_db()
     try:
-        query = "SELECT * FROM conversations WHERE 1=1"
-        params: List[Any] = []
-
-        if user_id is not None and user_id > 0:
-            query += " AND user_id = ?"
-            params.append(user_id)
+        query = "SELECT * FROM conversations WHERE user_id = ?"
+        params: List[Any] = [user_id]
 
         if search and search.strip():
             query += " AND (title LIKE ? OR last_question LIKE ? OR legal_topic LIKE ?)"
@@ -724,27 +752,24 @@ def get_conversation(
     conversation_id: str,
     user_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Load full previous conversation with all questions, answers, sources, timestamps, and analysis."""
+    """Load full previous conversation with all questions, answers, sources, timestamps, and analysis strictly isolated by user_id."""
+    if user_id is None or not conversation_id:
+        return None
+
     conn = _get_db()
     try:
-        if user_id is not None and user_id > 0:
-            row = conn.execute(
-                "SELECT * FROM conversations WHERE id = ? AND user_id = ?",
-                (conversation_id, user_id),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT * FROM conversations WHERE id = ?",
-                (conversation_id,),
-            ).fetchone()
+        row = conn.execute(
+            "SELECT * FROM conversations WHERE id = ? AND user_id = ?",
+            (conversation_id, user_id),
+        ).fetchone()
 
         if not row:
-            # Fallback check if it was in legacy chat_sessions
-            legacy_session = conn.execute("SELECT * FROM chat_sessions WHERE id = ?", (conversation_id,)).fetchone()
+            # Fallback check if it was in legacy chat_sessions for this exact user
+            legacy_session = conn.execute("SELECT * FROM chat_sessions WHERE id = ? AND user_id = ?", (conversation_id, user_id)).fetchone()
             if legacy_session:
                 legacy_msgs = conn.execute(
-                    "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY id ASC",
-                    (conversation_id,),
+                    "SELECT * FROM chat_messages WHERE session_id = ? AND user_id = ? ORDER BY id ASC",
+                    (conversation_id, user_id),
                 ).fetchall()
                 formatted_msgs = []
                 for m in legacy_msgs:
@@ -759,6 +784,7 @@ def get_conversation(
                         "sources": srcs,
                         "timestamp": m["timestamp"],
                         "created_at": m["created_at"],
+                        "legal_topic": "",
                     })
                 return {
                     "conversation_id": legacy_session["id"],
@@ -768,8 +794,8 @@ def get_conversation(
                     "updated_at": legacy_session["updated_at"],
                     "language": "English",
                     "question_count": len([m for m in formatted_msgs if m["role"] == "user"]),
-                    "last_question": formatted_msgs[-2]["text"] if len(formatted_msgs) >= 2 else "",
-                    "last_answer": formatted_msgs[-1]["text"] if len(formatted_msgs) >= 1 else "",
+                    "last_question": formatted_msgs[-1]["text"] if formatted_msgs else "",
+                    "last_answer": "",
                     "documents_count": 0,
                     "legal_topic": "general",
                     "status": "active",
@@ -966,32 +992,46 @@ def update_conversation_analysis(
 
 
 def delete_conversation(conversation_id: str, user_id: Optional[int] = None) -> bool:
-    """Safely delete a conversation and its messages."""
+    """Safely delete a conversation and its messages strictly scoped to user_id."""
+    if not conversation_id or user_id is None or user_id <= 0:
+        return False
     conn = _get_db()
     try:
         with conn:
-            if user_id is not None and user_id > 0:
-                conn.execute(
-                    "DELETE FROM conversation_messages WHERE conversation_id = ? AND user_id = ?",
+            # Check ownership first
+            owner_check = conn.execute(
+                "SELECT id FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            ).fetchone()
+
+            legacy_check = None
+            if not owner_check:
+                legacy_check = conn.execute(
+                    "SELECT id FROM chat_sessions WHERE id = ? AND user_id = ?",
                     (conversation_id, user_id),
-                )
-                conn.execute(
-                    "DELETE FROM conversations WHERE id = ? AND user_id = ?",
-                    (conversation_id, user_id),
-                )
-            else:
-                conn.execute(
-                    "DELETE FROM conversation_messages WHERE conversation_id = ?",
-                    (conversation_id,),
-                )
-                conn.execute(
-                    "DELETE FROM conversations WHERE id = ?",
-                    (conversation_id,),
-                )
-            # Also clean up from legacy tables if present
-            conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (conversation_id,))
-            conn.execute("DELETE FROM chat_sessions WHERE id = ?", (conversation_id,))
-        return True
+                ).fetchone()
+
+            if not owner_check and not legacy_check:
+                # User does not own this conversation
+                return False
+
+            conn.execute(
+                "DELETE FROM conversation_messages WHERE conversation_id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            )
+            conn.execute(
+                "DELETE FROM conversations WHERE id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            )
+            conn.execute(
+                "DELETE FROM chat_messages WHERE session_id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            )
+            conn.execute(
+                "DELETE FROM chat_sessions WHERE id = ? AND user_id = ?",
+                (conversation_id, user_id),
+            )
+            return True
     except Exception as e:
         print(f"Error deleting conversation: {e}")
         return False

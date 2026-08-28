@@ -1,3 +1,9 @@
+import sys
+import os
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT_DIR)
+sys.path.insert(0, os.path.join(ROOT_DIR, "backend"))
+
 from backend.rag_service import answer_question
 
 
@@ -22,7 +28,7 @@ for question in questions:
     print("=" * 80)
 
     try:
-        result = answer_question(question, 5)
+        result = answer_question(question)
 
         print(result["answer"])
 

@@ -67,6 +67,7 @@ from backend.legal_provision_service import (
 from backend.auth_service import (
     register_user,
     login_user,
+    logout_user,
     get_user_from_token,
     update_user_profile,
     get_user_stats,
@@ -356,6 +357,15 @@ def api_login(req: LoginRequest):
     if res.get("status") == "error":
         raise HTTPException(status_code=401, detail=res.get("message", "Invalid credentials"))
     return res
+
+
+@app.post("/auth/logout")
+def api_logout(authorization: Optional[str] = Header(None)):
+    if authorization:
+        parts = authorization.split()
+        token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else authorization
+        logout_user(token)
+    return {"status": "success", "message": "Logged out successfully."}
 
 
 @app.get("/auth/me")
@@ -806,6 +816,7 @@ def api_analyze_timeline(req: TimelineRequest):
 @app.post("/chat")
 async def ask_question(
     request: QuestionRequest,
+    authorization: Optional[str] = Header(None),
 ):
 
     question = str(
@@ -840,7 +851,7 @@ async def ask_question(
             "",
         )
 
-        return {
+        response_payload = {
             "status": "success",
             "question": question,
             "query": question,
@@ -851,6 +862,17 @@ async def ask_question(
                 [],
             ),
         }
+
+        user = _get_auth_user(authorization)
+        if user:
+            save_history_item(
+                user_id=user["id"],
+                item_type="qa",
+                title=question[:60],
+                data=response_payload,
+            )
+
+        return response_payload
 
     except Exception as error:
 
@@ -1042,6 +1064,7 @@ async def upload_document(
     file: UploadFile = File(...),
     language: Optional[str] = Form("english"),
     explanation_language: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
 ):
     allowed_extensions = {
         ".pdf",
@@ -1158,6 +1181,17 @@ async def upload_document(
             "provision_analysis": pipeline["provision_analysis"],
         }
 
+        user = _get_auth_user(authorization)
+        if user:
+            save_history_item(
+                user_id=user["id"],
+                item_type="document",
+                title=f"Doc: {file.filename}",
+                data=response_payload,
+            )
+
+        return response_payload
+
     except HTTPException:
         raise
     except Exception as error:
@@ -1177,6 +1211,7 @@ async def upload_multiple_documents(
     files: List[UploadFile] = File(...),
     language: Optional[str] = Form("english"),
     explanation_language: Optional[str] = Form(None),
+    authorization: Optional[str] = Header(None),
 ):
     """
     Upload and analyze multiple legal documents (PDFs, JPGs, PNGs, WEBPs)
@@ -1330,6 +1365,17 @@ async def upload_multiple_documents(
             "analysis": public_case_result,
             "provision_analysis": provision_analysis,
         }
+
+        user = _get_auth_user(authorization)
+        if user:
+            save_history_item(
+                user_id=user["id"],
+                item_type="case_dossier",
+                title=f"Case Package: {len(files)} docs",
+                data=response_payload,
+            )
+
+        return response_payload
 
     except Exception as error:
         print(
