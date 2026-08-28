@@ -68,6 +68,9 @@ import {
   History,
   CornerDownRight,
   TrendingUp,
+  LogIn,
+  UserPlus,
+  Globe,
 } from "lucide-react";
 
 const API_BASE = import.meta.env.VITE_API_URL || (
