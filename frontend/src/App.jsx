@@ -218,6 +218,40 @@ function detectLanguage(text = "") {
   return "english";
 }
 
+// Universal 16kHz Mono 16-bit PCM WAV Encoder (Zero dependencies, cross-browser Safari & Chrome)
+function encodeWavBlob(samples, sampleRate = 16000) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+
+  function writeString(offset, string) {
+    for (let i = 0; i < string.length; i++) {
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM format
+  view.setUint16(22, 1, true); // 1 channel mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true); // 16 bits per sample
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return new Blob([view], { type: "audio/wav" });
+}
+
 function renderInlineMarkdown(text = "") {
   if (!text) return "";
   const parts = String(text).split(/(\*\*.*?\*\*|\*.*?\*|`.*?`)/g);
@@ -454,17 +488,30 @@ export default function App() {
   );
   const [showThemePicker, setShowThemePicker] = useState(false);
 
-  // Voice Recording State (Groq Whisper Large v3 + MediaRecorder)
+  // Central Voice Recording State (Universal 16kHz PCM WAV + Groq Whisper)
   const [recording, setRecording] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState("");
   const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
+  const audioContextRef = useRef(null);
+  const audioProcessorRef = useRef(null);
+  const audioStreamRef = useRef(null);
+  const pcmSamplesRef = useRef([]);
   const recordingTimerRef = useRef(null);
+
+  // Document Case Studio Voice Q&A State
+  const [docVoiceRecording, setDocVoiceRecording] = useState(false);
+  const [docVoiceStatus, setDocVoiceStatus] = useState("");
+  const [docVoiceSeconds, setDocVoiceSeconds] = useState(0);
+  const docAudioContextRef = useRef(null);
+  const docAudioProcessorRef = useRef(null);
+  const docAudioStreamRef = useRef(null);
+  const docPcmSamplesRef = useRef([]);
+  const docRecordingTimerRef = useRef(null);
 
   // Multi-Document Studio State
   const [selectedFiles, setSelectedFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
+  const [analysisStep, setAnalysisStep] = useState(0);
   const [uploadResult, setUploadResult] = useState(null);
   const [activeDocSubTab, setActiveDocSubTab] = useState("summary");
   const [isDragging, setIsDragging] = useState(false);
@@ -473,6 +520,7 @@ export default function App() {
   const [docChatInput, setDocChatInput] = useState("");
   const [docChatLoading, setDocChatLoading] = useState(false);
   const [checkedSteps, setCheckedSteps] = useState({});
+  const [speakingDocMessageIndex, setSpeakingDocMessageIndex] = useState(null);
   const fileInputRef = useRef(null);
 
   // Timeline State
@@ -1128,133 +1176,248 @@ export default function App() {
         clearInterval(recordingTimerRef.current);
         recordingTimerRef.current = null;
       }
-
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-        setRecording(false);
-        setVoiceStatus(`Transcribing ${uiLang} with Whisper Large v3...`);
-        return;
-      }
-
-      if (window.recognitionInstance) {
-        window.recognitionInstance.stop();
-        setRecording(false);
-        setVoiceStatus("");
-        return;
-      }
-
       setRecording(false);
-      setVoiceStatus("");
-      return;
-    }
+      setVoiceStatus(`Transcribing ${uiLang.toUpperCase()} with Whisper Large v3...`);
 
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioChunksRef.current = [];
-
-        let mimeType = "audio/webm";
-        if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
-          mimeType = "audio/webm;codecs=opus";
-        } else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) {
-          mimeType = "audio/ogg;codecs=opus";
-        } else if (MediaRecorder.isTypeSupported("audio/mp4")) {
-          mimeType = "audio/mp4";
-        }
-
-        const recorder = new MediaRecorder(stream, { mimeType });
-        mediaRecorderRef.current = recorder;
-
-        recorder.ondataavailable = (e) => {
-          if (e.data && e.data.size > 0) {
-            audioChunksRef.current.push(e.data);
+      if (audioProcessorRef.current && audioStreamRef.current) {
+        try {
+          audioProcessorRef.current.disconnect();
+          audioStreamRef.current.getTracks().forEach((t) => t.stop());
+          if (audioContextRef.current && audioContextRef.current.state !== "closed") {
+            await audioContextRef.current.close().catch(() => {});
           }
-        };
 
-        recorder.onstop = async () => {
-          stream.getTracks().forEach((track) => track.stop());
-
-          const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-          if (audioBlob.size < 500) {
+          const samples = pcmSamplesRef.current || [];
+          if (samples.length < 2000) {
             setVoiceStatus("Recording was too short. Please speak clearly.");
             setTimeout(() => setVoiceStatus(""), 3000);
             return;
           }
 
-          setVoiceStatus(`Transcribing ${uiLang.toUpperCase()} with Whisper Large v3...`);
-
+          const wavBlob = encodeWavBlob(samples, 16000);
           const formData = new FormData();
-          const fileExt = mimeType.includes("ogg") ? "ogg" : mimeType.includes("mp4") ? "mp4" : "webm";
-          formData.append("file", audioBlob, `speech_query.${fileExt}`);
+          formData.append("file", wavBlob, "speech_query.wav");
           formData.append("language", uiLang);
 
-          try {
-            const res = await fetch(`${API_BASE}/speech-to-text`, {
-              method: "POST",
-              body: formData,
-            });
-            const data = await res.json();
-            if (res.ok && data.text) {
-              setQuestion(data.text);
-              setVoiceStatus("");
-            } else {
-              throw new Error(data.detail || "Whisper transcription returned empty result");
-            }
-          } catch (err) {
-            console.warn("Backend Whisper transcription error:", err);
-            setVoiceStatus("Whisper transcription failed. Please try again or type.");
-            setTimeout(() => setVoiceStatus(""), 4000);
+          const res = await fetch(`${API_BASE}/speech-to-text`, {
+            method: "POST",
+            body: formData,
+          });
+          const data = await res.json();
+          if (res.ok && data.text) {
+            setQuestion(data.text);
+            setVoiceStatus("");
+          } else {
+            throw new Error(data.detail || "Whisper transcription returned empty result");
           }
-        };
-
-        recorder.start(250);
-        setRecording(true);
-        setRecordingSeconds(0);
-        setVoiceStatus(`Listening in ${uiLang.toUpperCase()}... (Click mic again when finished)`);
-
-        recordingTimerRef.current = setInterval(() => {
-          setRecordingSeconds((prev) => prev + 1);
-        }, 1000);
-
+        } catch (err) {
+          console.warn("Backend Whisper transcription error:", err);
+          setVoiceStatus("Whisper transcription failed. Please try again or type.");
+          setTimeout(() => setVoiceStatus(""), 4000);
+        }
         return;
-      } catch (micErr) {
-        console.warn("Microphone getUserMedia failed or was blocked, falling back to Web Speech API:", micErr);
       }
+
+      if (window.recognitionInstance) {
+        window.recognitionInstance.stop();
+        setVoiceStatus("");
+      }
+      return;
     }
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SpeechRecognition) {
-      const recognition = new SpeechRecognition();
-      window.recognitionInstance = recognition;
-      recognition.continuous = false;
-      recognition.interimResults = false;
-      recognition.lang = uiLang === "hindi" ? "hi-IN" : uiLang === "kannada" ? "kn-IN" : "en-IN";
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
 
-      recognition.onstart = () => {
-        setRecording(true);
-        setVoiceStatus(`Listening in ${uiLang}...`);
+      audioStreamRef.current = stream;
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      audioContextRef.current = audioCtx;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      audioProcessorRef.current = processor;
+      pcmSamplesRef.current = [];
+
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < inputData.length; i++) {
+          pcmSamplesRef.current.push(inputData[i]);
+        }
       };
 
-      recognition.onresult = (e) => {
-        const transcript = e.results[0][0].transcript;
-        setQuestion(transcript);
-        setRecording(false);
-        setVoiceStatus("");
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      setRecording(true);
+      setRecordingSeconds(0);
+      setVoiceStatus(`Listening in ${uiLang.toUpperCase()}... (Click mic again when finished)`);
+
+      recordingTimerRef.current = setInterval(() => {
+        setRecordingSeconds((prev) => prev + 1);
+      }, 1000);
+    } catch (micErr) {
+      console.warn("Microphone AudioContext error, falling back to Web Speech API:", micErr);
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        window.recognitionInstance = recognition;
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = uiLang === "hindi" ? "hi-IN" : uiLang === "kannada" ? "kn-IN" : "en-IN";
+
+        recognition.onstart = () => {
+          setRecording(true);
+          setVoiceStatus(`Listening in ${uiLang}...`);
+        };
+        recognition.onresult = (e) => {
+          const transcript = e.results[0][0].transcript;
+          setQuestion(transcript);
+          setRecording(false);
+          setVoiceStatus("");
+        };
+        recognition.onerror = () => {
+          setRecording(false);
+          setVoiceStatus("");
+        };
+        recognition.onend = () => {
+          setRecording(false);
+          setVoiceStatus("");
+        };
+        recognition.start();
+      } else {
+        alert("Microphone recording is unavailable. Please grant microphone permissions or type directly.");
+      }
+    }
+  };
+
+  // Dedicated Voice Q&A for Document Case Studio
+  const handleToggleDocVoice = async () => {
+    if (docVoiceRecording) {
+      if (docRecordingTimerRef.current) {
+        clearInterval(docRecordingTimerRef.current);
+        docRecordingTimerRef.current = null;
+      }
+      setDocVoiceRecording(false);
+      setDocVoiceStatus(`Transcribing ${docExplanationLang.toUpperCase()} with Whisper Large v3...`);
+
+      if (docAudioProcessorRef.current && docAudioStreamRef.current) {
+        try {
+          docAudioProcessorRef.current.disconnect();
+          docAudioStreamRef.current.getTracks().forEach((t) => t.stop());
+          if (docAudioContextRef.current && docAudioContextRef.current.state !== "closed") {
+            await docAudioContextRef.current.close().catch(() => {});
+          }
+
+          const samples = docPcmSamplesRef.current || [];
+          if (samples.length < 2000) {
+            setDocVoiceStatus("Recording was too short. Please speak clearly.");
+            setTimeout(() => setDocVoiceStatus(""), 3000);
+            return;
+          }
+
+          const wavBlob = encodeWavBlob(samples, 16000);
+          const formData = new FormData();
+          formData.append("file", wavBlob, "doc_speech_query.wav");
+          formData.append("language", docExplanationLang);
+
+          const res = await fetch(`${API_BASE}/speech-to-text`, {
+            method: "POST",
+            body: formData,
+          });
+          const data = await res.json();
+          if (res.ok && data.text) {
+            setDocChatInput(data.text);
+            setDocVoiceStatus("");
+          } else {
+            throw new Error(data.detail || "Whisper transcription returned empty result");
+          }
+        } catch (err) {
+          console.warn("Doc voice transcription error:", err);
+          setDocVoiceStatus("Voice transcription failed. Please try again or type.");
+          setTimeout(() => setDocVoiceStatus(""), 4000);
+        }
+        return;
+      }
+
+      if (window.docRecognitionInstance) {
+        window.docRecognitionInstance.stop();
+        setDocVoiceStatus("");
+      }
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          sampleRate: 16000,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+
+      docAudioStreamRef.current = stream;
+      const audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      docAudioContextRef.current = audioCtx;
+      const source = audioCtx.createMediaStreamSource(stream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      docAudioProcessorRef.current = processor;
+      docPcmSamplesRef.current = [];
+
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < inputData.length; i++) {
+          docPcmSamplesRef.current.push(inputData[i]);
+        }
       };
 
-      recognition.onerror = () => {
-        setRecording(false);
-        setVoiceStatus("");
-      };
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
 
-      recognition.onend = () => {
-        setRecording(false);
-        setVoiceStatus("");
-      };
+      setDocVoiceRecording(true);
+      setDocVoiceSeconds(0);
+      setDocVoiceStatus(`Listening in ${docExplanationLang.toUpperCase()} for Document Q&A... (Click mic to stop)`);
 
-      recognition.start();
-    } else {
-      alert("Microphone recording is unavailable. Please grant microphone permissions or type your question directly.");
+      docRecordingTimerRef.current = setInterval(() => {
+        setDocVoiceSeconds((prev) => prev + 1);
+      }, 1000);
+    } catch (micErr) {
+      console.warn("Doc mic error, fallback to Web Speech API:", micErr);
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        const recognition = new SpeechRecognition();
+        window.docRecognitionInstance = recognition;
+        recognition.continuous = false;
+        recognition.interimResults = false;
+        recognition.lang = docExplanationLang === "hindi" ? "hi-IN" : docExplanationLang === "kannada" ? "kn-IN" : "en-IN";
+
+        recognition.onstart = () => {
+          setDocVoiceRecording(true);
+          setDocVoiceStatus(`Listening in ${docExplanationLang}...`);
+        };
+        recognition.onresult = (e) => {
+          const transcript = e.results[0][0].transcript;
+          setDocChatInput(transcript);
+          setDocVoiceRecording(false);
+          setDocVoiceStatus("");
+        };
+        recognition.onerror = () => {
+          setDocVoiceRecording(false);
+          setDocVoiceStatus("");
+        };
+        recognition.onend = () => {
+          setDocVoiceRecording(false);
+          setDocVoiceStatus("");
+        };
+        recognition.start();
+      } else {
+        alert("Microphone unavailable. Please grant permissions.");
+      }
     }
   };
 
@@ -1285,8 +1448,13 @@ export default function App() {
   const handleUploadAndAnalyze = async () => {
     if (selectedFiles.length === 0 || uploading) return;
     setUploading(true);
+    setAnalysisStep(1);
     setUploadResult(null);
     setDocChatMessages([]);
+
+    const stepInterval = setInterval(() => {
+      setAnalysisStep((prev) => (prev < 6 ? prev + 1 : prev));
+    }, 1100);
 
     const formData = new FormData();
     if (selectedFiles.length === 1) {
@@ -1296,14 +1464,18 @@ export default function App() {
         const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: formData });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Document analysis failed");
+        clearInterval(stepInterval);
+        setAnalysisStep(7);
         setUploadResult(data);
         setActiveDocSubTab("summary");
         if (data.timeline && data.timeline.length > 0) {
           setExtractedTimeline(data.timeline);
         }
       } catch (err) {
+        clearInterval(stepInterval);
         alert(err.message || "Document analysis failed.");
       } finally {
+        clearInterval(stepInterval);
         setUploading(false);
       }
     } else {
@@ -1313,21 +1485,25 @@ export default function App() {
         const res = await fetch(`${API_BASE}/upload-multiple`, { method: "POST", body: formData });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || "Multi-document case analysis failed");
+        clearInterval(stepInterval);
+        setAnalysisStep(7);
         setUploadResult(data);
         setActiveDocSubTab("summary");
         if (data.timeline && data.timeline.length > 0) {
           setExtractedTimeline(data.timeline);
         }
       } catch (err) {
+        clearInterval(stepInterval);
         alert(err.message || "Multi-document analysis failed.");
       } finally {
+        clearInterval(stepInterval);
         setUploading(false);
       }
     }
   };
 
   const handleDocChat = async (e) => {
-    e.preventDefault();
+    if (e && e.preventDefault) e.preventDefault();
     const q = docChatInput.trim();
     if (!q || docChatLoading || !uploadResult) return;
 
@@ -2448,6 +2624,28 @@ export default function App() {
                         </div>
                       )}
 
+                      {/* Smart Contextual Follow-Up Suggestions */}
+                      {msg.role === "assistant" && msg.followups && msg.followups.length > 0 && (
+                        <div className="smart-followups-container">
+                          <div className="followups-title">
+                            <Sparkles size={13} className="sparkle-icon" />
+                            <span>Suggested Legal Questions:</span>
+                          </div>
+                          <div className="followups-chips-row">
+                            {msg.followups.map((fq, fIdx) => (
+                              <button
+                                key={fIdx}
+                                className="followup-query-chip"
+                                onClick={() => handleSendQuestion(fq)}
+                              >
+                                <span>{fq}</span>
+                                <ChevronRight size={12} />
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
                       {/* Action Bar */}
                       {msg.role === "assistant" && (
                         <div className="bubble-action-bar">
@@ -2670,6 +2868,70 @@ export default function App() {
                 </div>
               )}
 
+              {/* 7-Stage Intelligence Pipeline Stepper */}
+              {uploading && (
+                <div className="analysis-progress-stepper-card">
+                  <div className="stepper-card-header">
+                    <div className="stepper-title-wrap">
+                      <Sparkles size={18} className="pulse-icon" />
+                      <h4>JanNyaya Multi-Document Legal Intelligence Pipeline</h4>
+                    </div>
+                    <span className="stepper-stage-count">Processing Stage {analysisStep || 1} of 7</span>
+                  </div>
+                  <div className="stepper-stages-grid">
+                    <div className={`stepper-stage-item ${analysisStep >= 1 ? (analysisStep > 1 ? 'done' : 'active') : ''}`}>
+                      <div className="stage-num-badge">{analysisStep > 1 ? <Check size={12} /> : 1}</div>
+                      <div className="stage-text-wrap">
+                        <strong>1. File Ingestion</strong>
+                        <span>Reading pages & binary streams</span>
+                      </div>
+                    </div>
+                    <div className={`stepper-stage-item ${analysisStep >= 2 ? (analysisStep > 2 ? 'done' : 'active') : ''}`}>
+                      <div className="stage-num-badge">{analysisStep > 2 ? <Check size={12} /> : 2}</div>
+                      <div className="stage-text-wrap">
+                        <strong>2. Multilingual OCR Vision</strong>
+                        <span>Extracting text & figure tables</span>
+                      </div>
+                    </div>
+                    <div className={`stepper-stage-item ${analysisStep >= 3 ? (analysisStep > 3 ? 'done' : 'active') : ''}`}>
+                      <div className="stage-num-badge">{analysisStep > 3 ? <Check size={12} /> : 3}</div>
+                      <div className="stage-text-wrap">
+                        <strong>3. Document Classification</strong>
+                        <span>Categorizing notice or contract</span>
+                      </div>
+                    </div>
+                    <div className={`stepper-stage-item ${analysisStep >= 4 ? (analysisStep > 4 ? 'done' : 'active') : ''}`}>
+                      <div className="stage-num-badge">{analysisStep > 4 ? <Check size={12} /> : 4}</div>
+                      <div className="stage-text-wrap">
+                        <strong>4. Fact & Amount Extraction</strong>
+                        <span>Isolating claims, dates & deadlines</span>
+                      </div>
+                    </div>
+                    <div className={`stepper-stage-item ${analysisStep >= 5 ? (analysisStep > 5 ? 'done' : 'active') : ''}`}>
+                      <div className="stage-num-badge">{analysisStep > 5 ? <Check size={12} /> : 5}</div>
+                      <div className="stage-text-wrap">
+                        <strong>5. Legal Risk & Obligation</strong>
+                        <span>Detecting liability & clauses</span>
+                      </div>
+                    </div>
+                    <div className={`stepper-stage-item ${analysisStep >= 6 ? (analysisStep > 6 ? 'done' : 'active') : ''}`}>
+                      <div className="stage-num-badge">{analysisStep > 6 ? <Check size={12} /> : 6}</div>
+                      <div className="stage-text-wrap">
+                        <strong>6. Statutory RAG Matching</strong>
+                        <span>Mapping BNS, BNSS, BSA & NI Act</span>
+                      </div>
+                    </div>
+                    <div className={`stepper-stage-item ${analysisStep >= 7 ? 'done' : analysisStep === 6 ? 'active' : ''}`}>
+                      <div className="stage-num-badge">{analysisStep >= 7 ? <Check size={12} /> : 7}</div>
+                      <div className="stage-text-wrap">
+                        <strong>7. Plain-Language Synthesis</strong>
+                        <span>Generating explanation in {docExplanationLang.toUpperCase()}</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* Comprehensive Document Analysis Results & Charts */}
               {uploadResult && (
                 <div className="document-analysis-dashboard">
@@ -2762,6 +3024,14 @@ export default function App() {
                     </button>
 
                     <button
+                      className={`doc-tab-btn ${activeDocSubTab === "compare" ? "active" : ""}`}
+                      onClick={() => setActiveDocSubTab("compare")}
+                    >
+                      <Layers size={15} />
+                      <span>Compare Documents</span>
+                    </button>
+
+                    <button
                       className={`doc-tab-btn ${activeDocSubTab === "chat" ? "active" : ""}`}
                       onClick={() => setActiveDocSubTab("chat")}
                     >
@@ -2797,10 +3067,21 @@ export default function App() {
                           </div>
                         )}
 
-                        <h4 className="section-title">
-                          <FileText size={18} />
-                          <span>Plain-Language Document Summary ({docExpLang === "kannada" ? "ಕನ್ನಡ" : docExpLang === "hindi" ? "हिन्दी" : "English"})</span>
-                        </h4>
+                        <div className="section-title-with-actions">
+                          <h4 className="section-title">
+                            <FileText size={18} />
+                            <span>Plain-Language Document Summary ({docExpLang === "kannada" ? "ಕನ್ನಡ" : docExpLang === "hindi" ? "हिन्दी" : "English"})</span>
+                          </h4>
+                          <button
+                            type="button"
+                            className="tts-read-aloud-action-btn"
+                            onClick={() => handleSpeakText(docSummary, 9999)}
+                            title={speakingIndex === 9999 ? "Stop Reading" : "Read Aloud Summary"}
+                          >
+                            {speakingIndex === 9999 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                            <span>{speakingIndex === 9999 ? "Stop" : "Read Aloud"}</span>
+                          </button>
+                        </div>
                         <div className="rendered-summary-body">
                           {renderFormattedContent(docSummary)}
                         </div>
@@ -3108,6 +3389,85 @@ export default function App() {
                       </div>
                     )}
 
+                    {/* TAB: Multi-Document Comparison Matrix */}
+                    {activeDocSubTab === "compare" && (
+                      <div className="doc-section-card comparison-dashboard-card">
+                        <h4 className="section-title">
+                          <Layers size={18} />
+                          <span>Multi-Document Comparative Analysis & Discrepancy Matrix</span>
+                        </h4>
+                        <p className="comparison-subtitle">
+                          Cross-instrument evaluation of clauses, conflicting payment demands, liability exposure, and procedural deadlines:
+                        </p>
+
+                        <div className="comparison-matrix-wrapper">
+                          <table className="styled-legal-table comparison-table">
+                            <thead>
+                              <tr>
+                                <th>Analytical Dimension</th>
+                                <th>Primary Notice / Claim Document</th>
+                                <th>Underlying Instrument / Standard Terms</th>
+                                <th>Discrepancy / Risk Assessment</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <tr>
+                                <td><strong>Document Classification</strong></td>
+                                <td><span className="metric-badge gold">{docTypeLabel}</span></td>
+                                <td><span className="metric-badge cyan">Loan / Commercial Instrument</span></td>
+                                <td><span className="status-tag verified">Corroborated</span></td>
+                              </tr>
+                              <tr>
+                                <td><strong>Claimed Financial Amounts</strong></td>
+                                <td>
+                                  {docAmounts.length > 0 ? (
+                                    <strong>{docAmounts.map(a => typeof a === 'object' ? (a.amount || JSON.stringify(a)) : a).join(", ")}</strong>
+                                  ) : "No specific sum claimed"}
+                                </td>
+                                <td>Principal Balance + Penal Surcharges</td>
+                                <td>
+                                  <span className="status-tag warning">Verify uncredited payments & compound interest calculations</span>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td><strong>Procedural Response Timeline</strong></td>
+                                <td>
+                                  {docDeadlines.length > 0 ? (
+                                    <strong>{docDeadlines.map(d => typeof d === 'object' ? (d.date || d.deadline || JSON.stringify(d)) : d).join(", ")}</strong>
+                                  ) : "Immediate compliance demanded"}
+                                </td>
+                                <td>Statutory 15-Day / 30-Day Notice Rule</td>
+                                <td>
+                                  <span className="status-tag alert">Time-sensitive reply required to preserve legal defense</span>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td><strong>Dispute Resolution Forum</strong></td>
+                                <td>Litigation Threat / Police Complaint</td>
+                                <td>Arbitration & Conciliation Clause / Lok Adalat</td>
+                                <td>
+                                  <span className="status-tag info">Mandatory pre-institution mediation may apply</span>
+                                </td>
+                              </tr>
+                            </tbody>
+                          </table>
+                        </div>
+
+                        {uploadResult.contradictions && uploadResult.contradictions.length > 0 && (
+                          <div className="conflicts-summary-box">
+                            <h5 className="sub-heading">Detected Clause Inconsistencies:</h5>
+                            <ul className="styled-clauses-list">
+                              {uploadResult.contradictions.map((conf, cIdx) => (
+                                <li key={cIdx}>
+                                  <strong>{conf.issue || "Inconsistency"}:</strong> {conf.detail || conf.description}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    )}
+
                     {/* TAB: Interactive Document Q&A */}
                     {activeDocSubTab === "chat" && (
                       <div className="doc-section-card interactive-chat-card">
@@ -3115,7 +3475,7 @@ export default function App() {
                           <MessageSquare size={18} />
                           <span>Interactive Document Q&A Assistant</span>
                         </h4>
-                        <p className="chat-subtext">Ask specific questions about this uploaded document (deadlines, liability, legal wording, or options):</p>
+                        <p className="chat-subtext">Ask specific questions about this uploaded document in {docExplanationLang.toUpperCase()} (deadlines, liability, legal wording, or options):</p>
 
                         {/* Quick Prompts */}
                         <div className="quick-doc-prompts-row">
@@ -3150,7 +3510,7 @@ export default function App() {
                           {docChatMessages.length === 0 ? (
                             <div className="empty-chat-state">
                               <HelpCircle size={24} className="help-icon" />
-                              <p>No questions asked yet. Type your question below to explore clauses, dates, or next actions.</p>
+                              <p>No questions asked yet. Use the microphone or type below to explore clauses, dates, or next actions.</p>
                             </div>
                           ) : (
                             docChatMessages.map((dm, dIdx) => (
@@ -3164,6 +3524,19 @@ export default function App() {
                                 <div className="dialog-text-body">
                                   {renderFormattedContent(dm.text)}
                                 </div>
+                                {dm.role === "assistant" && (
+                                  <div className="doc-bubble-action-row">
+                                    <button
+                                      type="button"
+                                      className="doc-tts-btn"
+                                      onClick={() => handleSpeakText(dm.text, dIdx + 5000)}
+                                      title={speakingIndex === dIdx + 5000 ? "Stop Listening" : "Listen (Read Aloud)"}
+                                    >
+                                      {speakingIndex === dIdx + 5000 ? <VolumeX size={13} /> : <Volume2 size={13} />}
+                                      <span>{speakingIndex === dIdx + 5000 ? "Stop" : "Listen"}</span>
+                                    </button>
+                                  </div>
+                                )}
                               </div>
                             ))
                           )}
@@ -3175,11 +3548,42 @@ export default function App() {
                           )}
                         </div>
 
+                        {/* Document Voice Live Banner */}
+                        {docVoiceRecording && (
+                          <div className="live-voice-recording-banner doc-voice-live-banner">
+                            <div className="recording-pulse-indicator" />
+                            <div className="recording-wave-visualizer">
+                              <span className="wave-bar bar1" />
+                              <span className="wave-bar bar2" />
+                              <span className="wave-bar bar3" />
+                              <span className="wave-bar bar4" />
+                              <span className="wave-bar bar5" />
+                            </div>
+                            <span className="recording-lang-badge">{docExplanationLang.toUpperCase()} VOICE</span>
+                            <span className="recording-timer-text">
+                              {Math.floor(docVoiceSeconds / 60)
+                                .toString()
+                                .padStart(2, "0")}
+                              :{(docVoiceSeconds % 60).toString().padStart(2, "0")}
+                            </span>
+                            <span className="recording-instruction-text">Ask question about document... click mic to finish</span>
+                          </div>
+                        )}
+
                         {/* Q&A Input Bar */}
-                        <form className="doc-dialog-input-form" onSubmit={handleDocChat}>
+                        <form className={`doc-dialog-input-form ${docVoiceRecording ? "recording-active" : ""}`} onSubmit={handleDocChat}>
+                          <button
+                            type="button"
+                            className={`voice-record-btn doc-voice-btn ${docVoiceRecording ? "recording" : ""}`}
+                            onClick={handleToggleDocVoice}
+                            title={docVoiceRecording ? "Stop Recording & Transcribe" : `Ask this Case by Voice (${docExplanationLang})`}
+                            aria-label="Voice question for this document"
+                          >
+                            {docVoiceRecording ? <MicOff size={16} /> : <Mic size={16} />}
+                          </button>
                           <input
                             type="text"
-                            placeholder="Ask a question about this document..."
+                            placeholder={docVoiceRecording ? `Listening in ${docExplanationLang.toUpperCase()}...` : "Ask a question about this document..."}
                             value={docChatInput}
                             onChange={(e) => setDocChatInput(e.target.value)}
                             disabled={docChatLoading}
@@ -3189,6 +3593,9 @@ export default function App() {
                             <span>Ask</span>
                           </button>
                         </form>
+                        {docVoiceStatus && !docVoiceRecording && (
+                          <div className="voice-status-indicator">{docVoiceStatus}</div>
+                        )}
                       </div>
                     )}
                   </div>

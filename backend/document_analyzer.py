@@ -80,14 +80,15 @@ DOCUMENT_ANALYSIS_MAX_CHARS = int(
 )
 
 
-# ============================================================
-# GROQ CLIENT
-# ============================================================
+def get_groq_client() -> Groq:
+    """Dynamically get Groq client with latest API key from environment."""
+    api_key = os.getenv("GROQ_API_KEY", "").strip() or GROQ_API_KEY or "gsk_placeholder"
+    return Groq(
+        api_key=api_key,
+        timeout=60.0,
+    )
 
-client = Groq(
-    api_key=GROQ_API_KEY or "gsk_placeholder",
-    timeout=60.0,
-)
+client = get_groq_client()
 
 
 # ============================================================
@@ -241,17 +242,29 @@ in the document.
 
 def build_prompt(
     text: str,
+    explanation_language: Optional[str] = None,
 ) -> str:
 
-    language = detect_language(
+    doc_lang = detect_language(
         text
     )
+
+    exp_lang = (explanation_language or doc_lang).lower().strip()
+
+    lang_instruction = ""
+    if exp_lang in ("hindi", "hi"):
+        lang_instruction = "\nEXPLANATION LANGUAGE INSTRUCTION:\nProvide the 'summary', 'legal_issues', 'possible_next_steps', and 'warnings' in natural, formal Hindi (हिन्दी) so an Indian citizen can understand clearly. Preserve exact statutory Section numbers."
+    elif exp_lang in ("kannada", "kn"):
+        lang_instruction = "\nEXPLANATION LANGUAGE INSTRUCTION:\nProvide the 'summary', 'legal_issues', 'possible_next_steps', and 'warnings' in natural, formal Kannada (ಕನ್ನಡ) so an Indian citizen can understand clearly. Preserve exact statutory Section numbers."
+    else:
+        lang_instruction = "\nEXPLANATION LANGUAGE INSTRUCTION:\nProvide the 'summary', 'legal_issues', 'possible_next_steps', and 'warnings' in clear, accessible Indian legal English."
 
     return f"""
 {SYSTEM_PROMPT}
 
 DOCUMENT LANGUAGE:
-{language_name(language)}
+{language_name(doc_lang)}
+{lang_instruction}
 
 DOCUMENT TEXT:
 ============================================================
@@ -488,6 +501,7 @@ def fallback_analysis(
 
 def analyze_document(
     text: str,
+    explanation_language: Optional[str] = None,
 ) -> Dict[str, Any]:
 
     if not text or not text.strip():
@@ -511,7 +525,8 @@ def analyze_document(
         ]
 
     prompt = build_prompt(
-        text
+        text,
+        explanation_language=explanation_language,
     )
 
     try:
@@ -531,12 +546,17 @@ def analyze_document(
             "Document characters:",
             len(text),
         )
+        print(
+            "Explanation language:",
+            explanation_language or "default",
+        )
 
         print(
             "Calling Groq document analyzer..."
         )
 
-        response = client.chat.completions.create(
+        active_client = get_groq_client()
+        response = active_client.chat.completions.create(
 
             model=GROQ_MODEL,
 

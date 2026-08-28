@@ -853,6 +853,10 @@ async def ask_question(
                 "sources",
                 [],
             ),
+            "followups": result.get(
+                "followups",
+                [],
+            ),
         }
 
         user = _get_auth_user(authorization)

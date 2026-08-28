@@ -935,6 +935,82 @@ def answer_question(
         facts,
     )
 
+def generate_smart_followups(
+    question: str,
+    facts: List[Dict[str, Any]],
+    language: str,
+) -> List[str]:
+    """Generate 3 contextual follow-up legal queries."""
+    lang = (language or "english").lower().strip()
+    q_lower = (question or "").lower()
+
+    # Kannada followups
+    if lang in ("kannada", "kn"):
+        if any(w in q_lower for w in ["ಕಳ್ಳತನ", "ಚೋರಿ", "ಅಪರಾಧ", "ಕೊಲೆ", "ಶಿಕ್ಷೆ", "theft", "murder"]):
+            return [
+                "ಈ ಅಪರಾಧಕ್ಕೆ ಬಿಎನ್‌ಎಸ್ (BNS 2023) ಅಡಿಯಲ್ಲಿ ನಿಖರ ಶಿಕ್ಷೆ ಮತ್ತು ದಂಡ ಏನು?",
+                "ಪೊಲೀಸ್ ಠಾಣೆಯಲ್ಲಿ ಜೀರೋ ಎಫ್‌ಐಆರ್ ಅಥವಾ ಇ-ಎಫ್‌ಐಆರ್ ದಾಖಲಿಸುವ ವಿಧಾನವೇನು?",
+                "ನಲ್ಸಾ (NALSA 15100) ಉಚಿತ ಕಾನೂನು ನೆರವು ಪಡೆಯುವುದು ಹೇಗೆ?",
+            ]
+        elif any(w in q_lower for w in ["ಚೆಕ್", "ಸಾಲ", "ಬ್ಯಾಂಕ್", "ನೋಟಿಸ್", "cheque", "loan"]):
+            return [
+                "ಸೆಕ್ಷನ್ 138 ರ ಅಡಿಯಲ್ಲಿ 30 ದಿನಗಳ ಶಾಸನಬದ್ಧ ನೋಟಿಸ್ ಪ್ರಕ್ರಿಯೆ ಏನು?",
+                "ಸಾಲ ವಸೂಲಾತಿ ಅಥವಾ ಲೋಕ ಅದಾಲತ್‌ನಲ್ಲಿ ರಾಜಿ ಮಾಡಿಕೊಳ್ಳಲು ಅವಕಾಶವಿದೆಯೇ?",
+                "ಬ್ಯಾಂಕ್ ನೋಟಿಸ್‌ಗೆ ಲಿಖಿತ ಉತ್ತರ ನೀಡುವ ಕಾನೂನು ಕ್ರಮಗಳೇನು?",
+            ]
+        return [
+            "ಈ ಕಾನೂನು ನಿಯಮ ನನ್ನ ಸನ್ನಿವೇಶಕ್ಕೆ ಹೇಗೆ ಅನ್ವಯವಾಗುತ್ತದೆ?",
+            "ನನ್ನ ಪರವಾಗಿ ಯಾವ ದಾಖಲೆಗಳನ್ನು ಮತ್ತು ಪುರಾವೆಗಳನ್ನು ಇಟ್ಟುಕೊಳ್ಳಬೇಕು?",
+            "ನಲ್ಸಾ (NALSA 15100) ಉಚಿತ ಕಾನೂನು ಸಹಾಯವಾಣಿಗೆ ಕರೆ ಮಾಡುವುದು ಹೇಗೆ?",
+        ]
+
+    # Hindi followups
+    if lang in ("hindi", "hi"):
+        if any(w in q_lower for w in ["चोरी", "सजा", "अपराध", "हत्या", "theft", "crime"]):
+            return [
+                "भारतीय न्याय संहिता 2023 (BNS) के तहत इस अपराध में क्या सजा और जुर्माना है?",
+                "बीएनएसएस (BNSS 173) के तहत ई-एफआईआर या जीरो एफआईआर कैसे दर्ज करें?",
+                "नालसा (NALSA 15100) से मुफ्त कानूनी सहायता कैसे प्राप्त करें?",
+            ]
+        elif any(w in q_lower for w in ["चेक", "ऋण", "लोन", "बैंक", "नोटिस", "cheque", "loan"]):
+            return [
+                "एनआई एक्ट की धारा 138 के तहत 30 दिन के कानूनी नोटिस की प्रक्रिया क्या है?",
+                "क्या चेक बाउंस मामले में लोक अदालत में समझौता किया जा सकता है?",
+                "बैंक या वित्तीय संस्थान के नोटिस का कानूनी जवाब कैसे दें?",
+            ]
+        return [
+            "यह कानूनी प्रावधान मेरी स्थिति में कैसे लागू हो सकता है?",
+            "अपने बचाव में कौन से दस्तावेज़ और साक्ष्य सुरक्षित रखने चाहिए?",
+            "नालसा (NALSA 15100) राष्ट्रीय कानूनी सेवा हेल्पलाइन से संपर्क कैसे करें?",
+        ]
+
+    # English followups
+    if any(w in q_lower for w in ["theft", "punishment", "bns", "crime", "fir", "bail", "arrest"]):
+        return [
+            "What is the statutory punishment and bailability under BNS 2023?",
+            "What is the procedure to register a Zero FIR or e-FIR under Section 173 of BNSS?",
+            "How can a citizen get free legal aid from NALSA via National Helpline 15100?",
+        ]
+    elif any(w in q_lower for w in ["cheque", "bounce", "138", "loan", "debt", "recovery", "notice"]):
+        return [
+            "What is the mandatory 30-day statutory notice procedure under Section 138 NI Act?",
+            "Can this financial claim be settled through Lok Adalat or pre-litigation mediation?",
+            "What are the legally valid defences against an unsubstantiated demand notice?",
+        ]
+    elif any(w in q_lower for w in ["consumer", "refund", "defective", "service", "daakhil"]):
+        return [
+            "How do I file an online consumer grievance on the e-Daakhil portal?",
+            "What compensation or punitive damages can be claimed under Consumer Protection Act 2019?",
+            "What is the statutory limitation period (2 years) to file a consumer complaint?",
+        ]
+    
+    return [
+        "Does this statutory provision apply to first-time occurrences or specific civil agreements?",
+        "What essential documents and electronic evidence should I preserve?",
+        "How do I contact the District Legal Services Authority (DLSA) / NALSA (15100) for free aid?",
+    ]
+
+
     # ========================================================
     # RESULT
     # ========================================================
@@ -946,11 +1022,18 @@ def answer_question(
 
     print("=" * 70)
 
+    followups = generate_smart_followups(
+        question,
+        facts,
+        language,
+    )
+
     return {
         "status": "success",
         "question": question,
         "answer": str(answer).strip(),
         "sources": sources,
+        "followups": followups,
     }
 
 

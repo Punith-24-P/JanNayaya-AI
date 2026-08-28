@@ -54,14 +54,15 @@ SPEECH_MODEL = os.getenv(
 )
 
 
-# ============================================================
-# GROQ CLIENT
-# ============================================================
+def get_groq_client() -> Groq:
+    """Dynamically get Groq client with latest API key from environment."""
+    api_key = os.getenv("GROQ_API_KEY", "").strip() or GROQ_API_KEY or "gsk_placeholder"
+    return Groq(
+        api_key=api_key,
+        timeout=120.0,
+    )
 
-client = Groq(
-    api_key=GROQ_API_KEY or "gsk_placeholder",
-    timeout=120.0,
-)
+client = get_groq_client()
 
 
 # ============================================================
@@ -319,8 +320,9 @@ def transcribe_audio(
                     "language"
                 ] = language_code
 
+            active_client = get_groq_client()
             transcription = (
-                client
+                active_client
                 .audio
                 .transcriptions
                 .create(
