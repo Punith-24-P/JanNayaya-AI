@@ -1,0 +1,11 @@
+.git
+.env
+venv/
+node_modules/
+frontend/
+__pycache__/
+*.py[cod]
+.DS_Store
+uploads/
+scratch/
+tests/

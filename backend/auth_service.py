@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = Path(os.environ.get("DATA_DIR", PROJECT_ROOT / "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "jannyaya_users.db"
+DB_PATH = Path(os.environ.get("DATABASE_PATH", DATA_DIR / "jannyaya_users.db"))
 
 
 def _get_db() -> sqlite3.Connection:

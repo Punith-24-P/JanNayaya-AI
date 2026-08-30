@@ -4,6 +4,7 @@ JanNyaya AI - FastAPI Backend
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import uuid
@@ -153,12 +154,39 @@ app = FastAPI(
 
 
 # ============================================================
-# CORS
+# CORS CONFIGURATION
 # ============================================================
+
+allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "")
+frontend_url_env = os.environ.get("FRONTEND_URL", "")
+
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "https://jan-nayaya-ai.vercel.app",
+    "https://jannayaya-ai.vercel.app",
+    "https://jannayaya.ai",
+    "https://www.jannayaya.ai",
+]
+
+if frontend_url_env:
+    for url in frontend_url_env.split(","):
+        clean_url = url.strip()
+        if clean_url and clean_url not in allowed_origins:
+            allowed_origins.append(clean_url)
+
+if allowed_origins_env:
+    for url in allowed_origins_env.split(","):
+        clean_url = url.strip()
+        if clean_url and clean_url not in allowed_origins:
+            allowed_origins.append(clean_url)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins if allowed_origins else ["*"],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

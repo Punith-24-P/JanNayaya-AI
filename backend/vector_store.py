@@ -1,3 +1,4 @@
+import os
 import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
@@ -9,7 +10,7 @@ import chromadb
 # CHROMADB CONFIGURATION
 # ============================================================
 
-CHROMA_PATH = Path("chroma_db")
+CHROMA_PATH = Path(os.environ.get("CHROMA_PATH", "chroma_db"))
 
 COLLECTION_NAME = "jan_nyaya_documents"
 
