@@ -29,6 +29,11 @@ from typing import Any, Dict
 from dotenv import load_dotenv
 from groq import Groq
 
+try:
+    from backend.document_intelligence import analyze_document_intelligence, DocumentIntelligenceService
+except ImportError:
+    from document_intelligence import analyze_document_intelligence, DocumentIntelligenceService
+
 
 # ============================================================
 # PROJECT / ENVIRONMENT
@@ -596,6 +601,12 @@ def analyze_document(
         result = normalize_result(
             result
         )
+
+        # Attach Advanced Document Intelligence (OCR Quality, Missing info, Claim mapping)
+        ocr_quality = DocumentIntelligenceService.calculate_ocr_quality(text)
+        missing_info = DocumentIntelligenceService.audit_missing_information(result, doc_text=text)
+        result["ocr_quality"] = ocr_quality
+        result["missing_information"] = missing_info
 
         print(
             "Document analysis successful."

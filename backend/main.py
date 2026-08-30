@@ -104,6 +104,15 @@ from backend.orchestrator import (
     DocumentIntakeAgent,
 )
 
+from backend.legal_query_planner import plan_legal_query
+from backend.evidence_graph import generate_evidence_graph
+from backend.document_intelligence import (
+    analyze_document_intelligence,
+    DocumentIntelligenceService,
+)
+from backend.grounding_guard import verify_grounding
+from backend.source_verifier import verify_sources
+
 
 # ============================================================
 # SPEECH SERVICE
@@ -165,6 +174,19 @@ class QuestionRequest(BaseModel):
     query: Optional[str] = None
     conversation_history: Optional[List[Dict[str, str]]] = None
     language: Optional[str] = "english"
+    mode: Optional[str] = "citizen"  # "citizen" | "research"
+
+
+class QueryPlanRequest(BaseModel):
+    question: str
+    has_doc_context: Optional[bool] = False
+
+
+class CompareAdvancedRequest(BaseModel):
+    doc_analyses: List[Dict[str, Any]]
+    doc_text: Optional[str] = ""
+    timeline_events: Optional[List[Dict[str, Any]]] = None
+    provisions: Optional[List[Dict[str, Any]]] = None
 
 
 class AnalyzeTextRequest(BaseModel):
@@ -179,6 +201,7 @@ class DocumentChatRequest(BaseModel):
     conversation_history: Optional[List[Dict[str, str]]] = None
     language: Optional[str] = "english"
     explanation_language: Optional[str] = None
+    mode: Optional[str] = "citizen"
 
 
 class RegisterRequest(BaseModel):
@@ -218,6 +241,7 @@ class ChatMessageRequest(BaseModel):
     question: str
     language: Optional[str] = None
     history: Optional[List[Dict[str, Any]]] = None
+    mode: Optional[str] = "citizen"
 
 
 class SaveHistoryRequest(BaseModel):
@@ -242,6 +266,7 @@ class PostMessageRequest(BaseModel):
     question: str
     language: Optional[str] = "English"
     history: Optional[List[Dict[str, Any]]] = None
+    mode: Optional[str] = "citizen"
 
 
 # ============================================================
@@ -637,6 +662,7 @@ def api_post_conversation_message(
         rag_result = answer_question(
             question=q,
             history=history,
+            mode=req.mode or "citizen",
         )
 
         if not isinstance(rag_result, dict):
@@ -644,7 +670,7 @@ def api_post_conversation_message(
 
         answer_text = rag_result.get("answer", "")
         sources = rag_result.get("sources", [])
-        legal_topic = rag_result.get("legal_topic") or rag_result.get("route") or "general"
+        legal_topic = rag_result.get("query_plan", {}).get("primary_domain") if isinstance(rag_result.get("query_plan"), dict) else (rag_result.get("legal_topic") or "general")
 
         updated_conv = add_conversation_turn(
             conversation_id=conversation_id,
@@ -662,6 +688,12 @@ def api_post_conversation_message(
             "question": q,
             "answer": answer_text,
             "sources": sources,
+            "query_plan": rag_result.get("query_plan"),
+            "evidence_graph": rag_result.get("evidence_graph"),
+            "grounding": rag_result.get("grounding"),
+            "followups": rag_result.get("followups", []),
+            "latency": rag_result.get("latency", {}),
+            "mode": req.mode or "citizen",
             "conversation": updated_conv,
         }
     except Exception as error:
@@ -827,6 +859,7 @@ async def ask_question(
         result = answer_question(
             question,
             history=request.conversation_history,
+            mode=request.mode or "citizen",
         )
 
         if not isinstance(
@@ -853,10 +886,27 @@ async def ask_question(
                 "sources",
                 [],
             ),
+            "query_plan": result.get(
+                "query_plan",
+                None,
+            ),
+            "evidence_graph": result.get(
+                "evidence_graph",
+                None,
+            ),
+            "grounding": result.get(
+                "grounding",
+                None,
+            ),
             "followups": result.get(
                 "followups",
                 [],
             ),
+            "latency": result.get(
+                "latency",
+                {},
+            ),
+            "mode": request.mode or "citizen",
         }
 
         user = _get_auth_user(authorization)
@@ -885,6 +935,70 @@ async def ask_question(
                 f"{str(error)}"
             ),
         )
+
+
+# ============================================================
+# ADVANCED INTELLIGENCE ENDPOINTS
+# ============================================================
+
+@app.post("/rag/query-plan")
+def api_query_plan(req: QueryPlanRequest):
+    """
+    Exposes deterministic & multi-hop legal query planning.
+    Returns query type, domain classification, detected acts, sections, and retrieval plan.
+    """
+    plan = plan_legal_query(req.question, has_doc_context=req.has_doc_context)
+    return {
+        "status": "success",
+        "plan": plan.to_dict(),
+    }
+
+
+@app.post("/document/compare-advanced")
+def api_compare_advanced(req: CompareAdvancedRequest):
+    """
+    Performs multi-document comparison, conflict & contradiction detection,
+    missing evidence auditing, OCR quality scoring, and case completeness calculation.
+    """
+    report = analyze_document_intelligence(
+        doc_analyses=req.doc_analyses,
+        doc_text=req.doc_text or "",
+        timeline_events=req.timeline_events or [],
+        provisions=req.provisions or [],
+    )
+    return {
+        "status": "success",
+        "report": report,
+    }
+
+
+@app.get("/health/detailed")
+def api_detailed_health():
+    """
+    Detailed system health monitoring including memory, vector store count,
+    embedding service status, and intelligence layer sub-engines.
+    """
+    try:
+        chunk_count = get_collection_count()
+    except Exception:
+        chunk_count = 0
+
+    return {
+        "status": "healthy",
+        "system": "JanNyaya AI Legal Assistance Platform",
+        "version": "2.0.0",
+        "knowledge_base_chunks": chunk_count,
+        "indexed_acts_count": len(CATEGORY_INFO),
+        "speech_available": SPEECH_AVAILABLE,
+        "intelligence_engines": {
+            "query_planner": "Active (14 Query Types, 11 Domains)",
+            "multi_hop_rag": "Active (RRF & Cross-Hop Synthesis)",
+            "source_verifier": "Active (Provenance & Authority Ranking)",
+            "evidence_graph": "Active (Claim-Evidence Mapping)",
+            "grounding_guard": "Active (Hallucination Detection)",
+            "document_intelligence": "Active (Contradiction & Missing Info Auditing)",
+        },
+    }
 
 
 # ============================================================

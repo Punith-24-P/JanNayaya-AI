@@ -24,6 +24,7 @@ Supported:
 """
 
 import os
+import time
 from typing import List, Dict, Any, Optional
 
 try:
@@ -35,6 +36,11 @@ try:
         build_fact_context,
     )
     from backend.llm_service import generate_answer
+    from backend.legal_query_planner import plan_legal_query
+    from backend.multi_hop_rag import execute_multi_hop_retrieval
+    from backend.source_verifier import verify_sources
+    from backend.evidence_graph import generate_evidence_graph
+    from backend.grounding_guard import verify_grounding
 except ImportError:
     from retriever import hybrid_search
     from legal_fact_extractor import (
@@ -44,6 +50,11 @@ except ImportError:
         build_fact_context,
     )
     from llm_service import generate_answer
+    from legal_query_planner import plan_legal_query
+    from multi_hop_rag import execute_multi_hop_retrieval
+    from source_verifier import verify_sources
+    from evidence_graph import generate_evidence_graph
+    from grounding_guard import verify_grounding
 
 
 # ============================================================
@@ -579,361 +590,8 @@ def _build_fallback_from_facts(
 
 
 # ============================================================
-# ANSWER QUESTION
+# SMART FOLLOW-UP GENERATOR
 # ============================================================
-
-def answer_question(
-    question: str,
-    history: Optional[Any] = None,
-) -> Dict[str, Any]:
-
-    if not isinstance(history, list):
-        history = []
-
-    if not question or not question.strip():
-
-        return {
-            "status": "error",
-            "question": question,
-            "answer": "Please enter a legal question.",
-            "sources": [],
-        }
-
-    question = question.strip()
-
-    print()
-    print("=" * 70)
-    print("JAN NYAYA AI - GROUNDED RAG QUERY")
-    print("=" * 70)
-
-    print(
-        f"Question: {question}"
-    )
-
-    intent = detect_fact_intent(
-        question
-    )
-
-    legal_term = detect_legal_term(
-        question
-    )
-
-    print()
-    print(
-        f"Detected intent: {intent}"
-    )
-
-    print(
-        f"Detected legal term: {legal_term}"
-    )
-
-    search_query = question
-    if history and isinstance(history, list) and len(history) > 0:
-        recent_user_queries = [
-            str(h.get("content", "")) for h in history if h.get("role") == "user" and str(h.get("content", "")).strip()
-        ]
-        if recent_user_queries:
-            last_query = recent_user_queries[-1]
-            if not legal_term or len(question.split()) < 7 or any(w in question.lower() for w in ["what if", "is it", "can they", "how about", "in this case", "punishment", "bail", "arrest", "penalty", "liable"]):
-                search_query = f"{last_query} {question}"
-                print(f"Contextualized multi-turn search query: {search_query}")
-
-    # ========================================================
-    # RETRIEVAL
-    # ========================================================
-
-    print()
-    print(
-        "Running legal retrieval..."
-    )
-
-    try:
-
-        results = hybrid_search(
-            search_query,
-            semantic_k=30,
-            bm25_k=30,
-            final_k=RAG_TOP_K,
-        )
-
-    except Exception as error:
-
-        print()
-        print(
-            "RETRIEVAL ERROR:",
-            type(error).__name__,
-            str(error),
-        )
-
-        return {
-            "status": "error",
-            "question": question,
-            "answer": (
-                "An error occurred while retrieving "
-                "the legal documents."
-            ),
-            "sources": [],
-        }
-
-    print(
-        f"Retrieved results: {len(results)}"
-    )
-
-    if not results:
-
-        language = detect_language(
-            question
-        )
-
-        return {
-            "status": "success",
-            "question": question,
-            "answer": (
-                "The available legal documents do not "
-                "contain relevant information."
-                "\n\n"
-                + _disclaimer(language)
-            ),
-            "sources": [],
-        }
-
-    # ========================================================
-    # STRUCTURED LEGAL FACTS
-    # ========================================================
-
-    print()
-    print(
-        "Extracting structured legal facts..."
-    )
-
-    try:
-
-        facts = extract_legal_facts(
-            question,
-            results,
-            max_groups=RAG_MAX_FACT_GROUPS,
-        )
-
-    except Exception as error:
-
-        print()
-        print(
-            "FACT EXTRACTION ERROR:",
-            type(error).__name__,
-            str(error),
-        )
-
-        facts = []
-
-    print(
-        f"Extracted legal fact groups: "
-        f"{len(facts)}"
-    )
-
-    # ========================================================
-    # IMPORTANT FALLBACK:
-    #
-    # If extractor somehow returns zero even though retrieval
-    # contains Section 303, create a direct fact from the
-    # strongest retrieved result.
-    # ========================================================
-
-    if not facts and results:
-        print()
-        print("Fact extractor returned 0. Building direct evidence facts from top retrieved results...")
-
-        for result in results[:3]:
-            if not isinstance(result, dict):
-                continue
-            metadata = result.get("metadata", {})
-            if not isinstance(metadata, dict):
-                continue
-
-            sec = str(metadata.get("section_number", "")).strip()
-            title = str(metadata.get("section_title", "")).strip()
-            doc_text = str(result.get("document", "")).strip()
-            if not doc_text:
-                continue
-
-            fallback_fact = {
-                "section": sec,
-                "section_title": title,
-                "source": metadata.get("source", "Official Gazette"),
-                "title": metadata.get("title", metadata.get("act_name", "Statutory Act")),
-                "document_type": metadata.get("document_type", "Act"),
-                "year": metadata.get("year", None),
-                "best_chunk": metadata.get("chunk_index", None),
-                "direct_offence": True,
-                "query_intent": intent,
-                "legal_term": legal_term or metadata.get("route", "general"),
-                "score": float(result.get("legal_rerank_score", result.get("score", 1.0))),
-                "punishment_facts": [],
-                "definition_facts": [doc_text],
-                "condition_facts": [],
-            }
-
-            lower_doc = doc_text.lower()
-            if "shall be punished" in lower_doc or "punished with" in lower_doc or "penalty" in lower_doc:
-                fallback_fact["punishment_facts"] = [doc_text]
-
-            facts.append(fallback_fact)
-
-        if facts:
-            print(f"Direct evidence fallback created with {len(facts)} statutory facts.")
-
-    # ========================================================
-    # STILL NOTHING
-    # ========================================================
-
-    if not facts:
-
-        language = detect_language(
-            question
-        )
-
-        return {
-            "status": "success",
-            "question": question,
-            "answer": (
-                (
-                    "The available legal documents do not "
-                    "contain enough information to answer "
-                    "this question."
-                )
-                + "\n\n"
-                + _disclaimer(language)
-            ),
-            "sources": build_sources(
-                results,
-                [],
-            ),
-        }
-
-    # ========================================================
-    # DEBUG FACTS
-    # ========================================================
-
-    for index, fact in enumerate(
-        facts,
-        start=1,
-    ):
-
-        print()
-        print(
-            f"[FACT {index}]"
-        )
-
-        print(
-            "Section:",
-            fact.get(
-                "section",
-                "",
-            ),
-        )
-
-        print(
-            "Title:",
-            fact.get(
-                "section_title",
-                "",
-            ),
-        )
-
-        print(
-            "Direct:",
-            fact.get(
-                "direct_offence",
-                False,
-            ),
-        )
-
-    # ========================================================
-    # BUILD FACT CONTEXT
-    # ========================================================
-
-    print()
-    print(
-        "Building structured legal context..."
-    )
-
-    context = build_fact_context(
-        facts,
-        max_characters=RAG_MAX_CONTEXT_CHARS,
-    )
-
-    print(
-        f"Fact context characters: "
-        f"{len(context)}"
-    )
-
-    if not context:
-
-        # Deterministic answer without LLM.
-        answer = _build_fallback_from_facts(
-            question,
-            facts,
-        )
-
-        return {
-            "status": "success",
-            "question": question,
-            "answer": answer,
-            "sources": build_sources(
-                results,
-                facts,
-            ),
-        }
-
-    # ========================================================
-    # GENERATE
-    # ========================================================
-
-    print()
-    print(
-        "Generating grounded answer..."
-    )
-
-    try:
-
-        answer = generate_answer(
-            question,
-            context,
-            history=history,
-        )
-
-    except Exception as error:
-
-        print()
-        print(
-            "LLM ERROR:",
-            type(error).__name__,
-            str(error),
-        )
-
-        answer = _build_fallback_from_facts(
-            question,
-            facts,
-        )
-
-    # ========================================================
-    # SAFETY CHECK
-    # ========================================================
-
-    if not answer or not str(answer).strip():
-
-        answer = _build_fallback_from_facts(
-            question,
-            facts,
-        )
-
-    # ========================================================
-    # SOURCES
-    # ========================================================
-
-    sources = build_sources(
-        results,
-        facts,
-    )
 
 def generate_smart_followups(
     question: str,
@@ -1003,7 +661,7 @@ def generate_smart_followups(
             "What compensation or punitive damages can be claimed under Consumer Protection Act 2019?",
             "What is the statutory limitation period (2 years) to file a consumer complaint?",
         ]
-    
+
     return [
         "Does this statutory provision apply to first-time occurrences or specific civil agreements?",
         "What essential documents and electronic evidence should I preserve?",
@@ -1011,29 +669,226 @@ def generate_smart_followups(
     ]
 
 
-    # ========================================================
-    # RESULT
-    # ========================================================
+# ============================================================
+# ANSWER QUESTION
+# ============================================================
+
+def answer_question(
+    question: str,
+    history: Optional[Any] = None,
+    mode: str = "citizen",
+) -> Dict[str, Any]:
+
+    t_start = time.time()
+
+    if not isinstance(history, list):
+        history = []
+
+    if not question or not question.strip():
+        return {
+            "status": "error",
+            "question": question,
+            "answer": "Please enter a legal question.",
+            "sources": [],
+            "query_plan": None,
+            "evidence_graph": None,
+            "grounding": None,
+            "followups": [],
+            "latency": {"total_ms": 0},
+        }
+
+    question = question.strip()
 
     print()
-    print(
-        "RAG answer generated successfully."
-    )
-
     print("=" * 70)
+    print("JAN NYAYA AI - ADVANCED GROUNDED LEGAL RAG PIPELINE")
+    print("=" * 70)
+    print(f"Question: {question}")
+    print(f"Consultation Mode: {mode.upper()}")
 
-    followups = generate_smart_followups(
-        question,
+    # 1. ADVANCED LEGAL QUERY PLANNER
+    t_plan_start = time.time()
+    plan = plan_legal_query(question)
+    t_plan_ms = int((time.time() - t_plan_start) * 1000)
+
+    print(f"[Query Plan] Type: {plan.query_type} | Domain: {plan.primary_domain} | Route: {plan.primary_route} | Multi-Hop: {plan.is_multi_hop}")
+
+    search_query = question
+    if history and isinstance(history, list) and len(history) > 0:
+        recent_user_queries = [
+            str(h.get("content", "")) for h in history if h.get("role") == "user" and str(h.get("content", "")).strip()
+        ]
+        if recent_user_queries:
+            last_query = recent_user_queries[-1]
+            if len(question.split()) < 7 or any(w in question.lower() for w in ["what if", "is it", "can they", "how about", "in this case", "punishment", "bail", "arrest", "penalty", "liable"]):
+                search_query = f"{last_query} {question}"
+                print(f"Contextualized multi-turn search query: {search_query}")
+
+    # 2. RETRIEVAL (MULTI-HOP or SINGLE-HOP HYBRID SEARCH)
+    t_ret_start = time.time()
+    try:
+        if plan.is_multi_hop and len(plan.sub_queries) > 1:
+            print(f"[RAG] Executing Multi-Hop RAG across {len(plan.sub_queries)} statutory sub-queries...")
+            results = execute_multi_hop_retrieval(
+                plan=plan,
+                semantic_k=30,
+                bm25_k=30,
+                final_k=RAG_TOP_K,
+            )
+        else:
+            print("[RAG] Executing Single-Hop Hybrid Retrieval...")
+            results = hybrid_search(
+                search_query,
+                semantic_k=30,
+                bm25_k=30,
+                final_k=RAG_TOP_K,
+            )
+    except Exception as error:
+        print("RETRIEVAL ERROR:", type(error).__name__, str(error))
+        return {
+            "status": "error",
+            "question": question,
+            "answer": "An error occurred while retrieving the legal documents.",
+            "sources": [],
+            "query_plan": plan.to_dict(),
+            "evidence_graph": None,
+            "grounding": None,
+            "followups": [],
+            "latency": {"total_ms": int((time.time() - t_start) * 1000)},
+        }
+
+    t_ret_ms = int((time.time() - t_ret_start) * 1000)
+    print(f"Retrieved results: {len(results)} (in {t_ret_ms} ms)")
+
+    language = detect_language(question)
+
+    if not results:
+        return {
+            "status": "success",
+            "question": question,
+            "answer": (
+                "The available legal documents do not contain relevant information."
+                "\n\n"
+                + _disclaimer(language)
+            ),
+            "sources": [],
+            "query_plan": plan.to_dict(),
+            "evidence_graph": None,
+            "grounding": {
+                "confidence_level": "Insufficient Evidence",
+                "grounding_score": 0.0,
+                "notes": "No matching statutory documents found.",
+            },
+            "followups": generate_smart_followups(question, [], language),
+            "latency": {"total_ms": int((time.time() - t_start) * 1000)},
+        }
+
+    # 3. STRUCTURED LEGAL FACT EXTRACTION
+    try:
+        facts = extract_legal_facts(
+            question,
+            results,
+            max_groups=RAG_MAX_FACT_GROUPS,
+        )
+    except Exception as error:
+        print("FACT EXTRACTION ERROR:", type(error).__name__, str(error))
+        facts = []
+
+    # Fallback to top direct evidence chunks if extractor returns 0
+    if not facts and results:
+        print("Building direct evidence facts from top retrieved results...")
+        for result in results[:3]:
+            if not isinstance(result, dict):
+                continue
+            metadata = result.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            sec = str(metadata.get("section_number", "")).strip()
+            title = str(metadata.get("section_title", "")).strip()
+            doc_text = str(result.get("document", "")).strip()
+            if not doc_text:
+                continue
+
+            fallback_fact = {
+                "section": sec,
+                "section_title": title,
+                "source": metadata.get("source", "Official Gazette"),
+                "title": metadata.get("title", metadata.get("act_name", "Statutory Act")),
+                "document_type": metadata.get("document_type", "Act"),
+                "year": metadata.get("year", None),
+                "best_chunk": metadata.get("chunk_index", None),
+                "direct_offence": True,
+                "query_intent": plan.query_type.lower(),
+                "legal_term": plan.primary_domain,
+                "score": float(result.get("legal_rerank_score", result.get("score", 1.0))),
+                "punishment_facts": [],
+                "definition_facts": [doc_text],
+                "condition_facts": [],
+            }
+            lower_doc = doc_text.lower()
+            if "shall be punished" in lower_doc or "punished with" in lower_doc or "penalty" in lower_doc:
+                fallback_fact["punishment_facts"] = [doc_text]
+            facts.append(fallback_fact)
+
+    # 4. LEGAL SOURCE VERIFICATION & CITATION HIERARCHY
+    verified_sources = verify_sources(results, facts)
+
+    context = build_fact_context(
         facts,
-        language,
+        max_characters=RAG_MAX_CONTEXT_CHARS,
     )
+
+    # 5. GROUNDED ANSWER GENERATION
+    t_llm_start = time.time()
+    if not context:
+        answer = _build_fallback_from_facts(question, facts)
+    else:
+        try:
+            answer = generate_answer(
+                question,
+                context,
+                history=history,
+            )
+        except Exception as error:
+            print("LLM ERROR:", type(error).__name__, str(error))
+            answer = _build_fallback_from_facts(question, facts)
+
+    if not answer or not str(answer).strip():
+        answer = _build_fallback_from_facts(question, facts)
+
+    t_llm_ms = int((time.time() - t_llm_start) * 1000)
+
+    # 6. GROUNDING GUARD & EVIDENCE GRAPH
+    grounding_report = verify_grounding(str(answer), verified_sources, facts)
+    evidence_graph = generate_evidence_graph(
+        question=question,
+        sources=verified_sources,
+        facts=facts,
+        domain=plan.primary_domain,
+    )
+    followups = generate_smart_followups(question, facts, language)
+
+    t_total_ms = int((time.time() - t_start) * 1000)
+
+    print(f"RAG complete. Latency: Plan={t_plan_ms}ms, Retrieval={t_ret_ms}ms, LLM={t_llm_ms}ms, Total={t_total_ms}ms")
+    print(f"Grounding Confidence: {grounding_report.get('confidence_level')} (Score: {grounding_report.get('grounding_score')})")
+    print("=" * 70)
 
     return {
         "status": "success",
         "question": question,
         "answer": str(answer).strip(),
-        "sources": sources,
+        "sources": verified_sources,
+        "query_plan": plan.to_dict(),
+        "evidence_graph": evidence_graph,
+        "grounding": grounding_report,
         "followups": followups,
+        "latency": {
+            "planning_ms": t_plan_ms,
+            "retrieval_ms": t_ret_ms,
+            "llm_ms": t_llm_ms,
+            "total_ms": t_total_ms,
+        },
     }
 
 
